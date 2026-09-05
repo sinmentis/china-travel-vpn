@@ -17,7 +17,7 @@ Install the local tools, then clone the repository:
 
 ```bash
 sudo apt update
-sudo apt install -y git curl python3 openssh-client openssl coreutils tar qrencode
+sudo apt install -y git curl python3 openssh-client openssl coreutils util-linux tar qrencode
 git clone https://github.com/sinmentis/china-travel-vpn.git
 cd china-travel-vpn
 ```
@@ -78,8 +78,17 @@ passwords. The files are Git-ignored, not encrypted; back up `.env.vultr` and
 ./scripts/bring-up.sh --verify-only
 ```
 
-This skips installation, configuration, and reboot, but refreshes local records
-and import files. It can also upload a missing SSH public key or start a stopped
-instance; it is not a strictly read-only command.
+This checks the existing instance without creating, starting, or reconfiguring
+it. Saved credentials, instance records, SSH host keys, and client imports are
+left alone. A missing key or a stopped instance is reported as an error.
+
+To explicitly regenerate the client import files after a successful check:
+
+```bash
+./scripts/bring-up.sh --verify-only --export-client
+```
+
+Keep the complete credentials together. An incomplete set is rejected rather
+than silently replaced with new credentials that disconnect existing clients.
 
 When finished, use [teardown](05-testing-and-teardown.md#teardown).

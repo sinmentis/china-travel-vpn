@@ -33,14 +33,19 @@ curl -s -o /dev/null -w 'http=%{http_code}\n' "https://$CANDIDATE/"
 安装脚本的提交和校验值与 `bring-up.sh` 保持一致。
 
 ```bash
+(
+set -euo pipefail
 INSTALLER_COMMIT=e741a4f56d368afbb9e5be3361b40c4552d3710d
 INSTALLER_SHA256=7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555
+INSTALL_DIR=$(mktemp -d)
+trap 'rm -f "$INSTALL_DIR/install-release.sh"; rmdir "$INSTALL_DIR"' EXIT
 curl -fsSL \
   "https://raw.githubusercontent.com/XTLS/Xray-install/$INSTALLER_COMMIT/install-release.sh" \
-  -o /tmp/xray-install.sh &&
-printf '%s  %s\n' "$INSTALLER_SHA256" /tmp/xray-install.sh | sha256sum -c - &&
-TERM=xterm bash /tmp/xray-install.sh install --version v26.7.28
-xray version | head -1
+  -o "$INSTALL_DIR/install-release.sh" &&
+printf '%s  %s\n' "$INSTALLER_SHA256" "$INSTALL_DIR/install-release.sh" | sha256sum -c - &&
+TERM=xterm bash "$INSTALL_DIR/install-release.sh" install --version v26.7.28
+xray version
+)
 ```
 
 校验必须通过，版本应以 `Xray 26.7.28` 开头。任何一项不对，先停在这里。

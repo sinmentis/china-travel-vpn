@@ -14,8 +14,8 @@ blocked network path can look much the same from a phone.
 | Need a different instance | [Replacement](#replace-server) |
 
 Replace `SERVER_IP` with your public IPv4. Server commands below use `sudo`
-for an `ops` login. The [script setup](docs/quickstart.md) explains what
-`--verify-only` checks and its side effects.
+for an `ops` login. The [script setup](docs/quickstart.md) explains the read-only
+`--verify-only` mode and the separate client-export option.
 
 <a id="server-state"></a>
 
@@ -191,7 +191,7 @@ ENV_FILE=.env.vultr ./scripts/bring-down.sh --yes
 
 ```bash
 mv .env.replacement .env.vultr
-./scripts/bring-up.sh --verify-only
+./scripts/bring-up.sh --verify-only --export-client
 ```
 
 Simply rerunning `bring-up.sh` with the old label would reuse the old instance,

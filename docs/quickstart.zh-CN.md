@@ -15,7 +15,7 @@
 
 ```bash
 sudo apt update
-sudo apt install -y git curl python3 openssh-client openssl coreutils tar qrencode
+sudo apt install -y git curl python3 openssh-client openssl coreutils util-linux tar qrencode
 git clone https://github.com/sinmentis/china-travel-vpn.git
 cd china-travel-vpn
 ```
@@ -73,7 +73,16 @@ printf '\n'
 ./scripts/bring-up.sh --verify-only
 ```
 
-这个模式跳过安装、写服务配置和重启，但会刷新本地记录与导入文件。
-它还可能补传缺失的 SSH 公钥，或启动已停止的实例，所以不是严格的只读命令。
+这个模式只检查已有实例，不会创建、启动或重新配置服务器。
+保存的凭据、实例记录、SSH 主机密钥和客户端导入文件都不改。
+缺少密钥或实例已关机，会直接报错。
+
+检查成功后，如果确实要重新生成客户端导入文件，显式加上这个选项：
+
+```bash
+./scripts/bring-up.sh --verify-only --export-client
+```
+
+凭据要完整保存。漏掉其中一项会报错，不会偷偷换一套新凭据，让原来的客户端突然断开。
 
 用完后按[销毁步骤](05-testing-and-teardown.zh-CN.md#teardown)收尾。

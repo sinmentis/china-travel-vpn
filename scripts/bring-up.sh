@@ -4,21 +4,35 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env.vultr}"
 API="${VULTR_API:-https://api.vultr.com/v2}"
+# shellcheck source=scripts/lib/vultr.sh
+source "$ROOT_DIR/scripts/lib/vultr.sh"
 XRAY_INSTALLER_COMMIT="e741a4f56d368afbb9e5be3361b40c4552d3710d"
 XRAY_INSTALLER_SHA256="7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555"
 VERIFY_ONLY=0
+EXPORT_CLIENT=0
 
 for argument in "$@"; do
   case "$argument" in
     --verify-only) VERIFY_ONLY=1 ;;
+    --export-client) EXPORT_CLIENT=1 ;;
+    --help)
+      echo "Usage: $0 [--verify-only [--export-client]]"
+      echo "Deploy the configured instance, or verify it without changing persistent state."
+      exit 0
+      ;;
     *)
-      echo "Usage: $0 [--verify-only]" >&2
+      echo "Usage: $0 [--verify-only [--export-client]]" >&2
       exit 2
       ;;
   esac
 done
+if (( EXPORT_CLIENT == 1 && VERIFY_ONLY == 0 )); then
+  echo "ERROR: --export-client requires --verify-only; deployment already exports the client." >&2
+  exit 2
+fi
 
 log() {
+  STAGE="$*"
   printf '==> %s\n' "$*"
 }
 
@@ -43,6 +57,7 @@ validate_reality_credentials() {
 }
 
 set_env() {
+  (( VERIFY_ONLY == 0 )) || die "Refusing to write settings during verification"
   local key="$1"
   local value="$2"
   local temporary
@@ -51,28 +66,6 @@ set_env() {
   printf '%s=%q\n' "$key" "$value" >>"$temporary"
   chmod 600 "$temporary"
   mv "$temporary" "$ENV_FILE"
-}
-
-api_get() {
-  curl --fail-with-body -sS \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "$VULTR_API_KEY") \
-    "$API$1"
-}
-
-api_post() {
-  local path="$1"
-  local data="$2"
-  curl --fail-with-body -sS -X POST \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "$VULTR_API_KEY") \
-    -H 'Content-Type: application/json' \
-    --data "$data" \
-    "$API$path"
-}
-
-api_post_empty() {
-  curl --fail-with-body -sS -o /dev/null -X POST \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "$VULTR_API_KEY") \
-    "$API$1"
 }
 
 wait_for_ssh() {
@@ -95,9 +88,10 @@ test_reality_client() {
   esac
 
   asset="sing-box-1.14.0-linux-${architecture}.tar.gz"
-  directory="$(mktemp -d)"
+  directory="$RUN_DIR/client"
+  mkdir -m 700 "$directory"
   metadata="$(
-    curl -fsS https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.14.0 |
+    curl -qfsS --connect-timeout 10 --max-time 60 https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.14.0 |
       python3 -c '
 import json, sys
 name = sys.argv[1]
@@ -108,7 +102,9 @@ print(asset["digest"])
   )"
   url="$(sed -n '1p' <<<"$metadata")"
   digest="$(sed -n '2p' <<<"$metadata")"
-  curl -fsSL -o "$directory/$asset" "$url"
+  [[ "$url" == https://github.com/SagerNet/sing-box/releases/download/* &&
+      "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Invalid sing-box release metadata"
+  curl -qfsSL --connect-timeout 10 --max-time 120 -o "$directory/$asset" "$url"
   [[ "sha256:$(sha256sum "$directory/$asset" | awk '{print $1}')" == "$digest" ]] ||
     die "sing-box checksum mismatch"
   tar -xzf "$directory/$asset" -C "$directory"
@@ -152,8 +148,8 @@ print(json.dumps({
 PY
 
   "$binary" check -c "$directory/client.json"
-  timeout 12s "$binary" run -c "$directory/client.json" >"$directory/client.log" 2>&1 &
-  local proxy_pid=$!
+  timeout 20s "$binary" run -c "$directory/client.json" >"$directory/client.log" 2>&1 &
+  CLIENT_PID=$!
   egress=""
   for _ in $(seq 1 20); do
     egress="$(
@@ -163,17 +159,20 @@ PY
     [[ -n "$egress" ]] && break
     sleep 0.5
   done
-  wait "$proxy_pid" 2>/dev/null || true
+  local client_status=0
+  wait "$CLIENT_PID" || client_status=$?
+  CLIENT_PID=""
+  [[ "$client_status" == 124 ]] || die "The temporary sing-box client exited unexpectedly"
   if [[ "$egress" != "$PRIMARY_IP" ]]; then
     sed -n '1,80p' "$directory/client.log" >&2
-    rm -rf "$directory"
     die "Authenticated REALITY client test failed"
   fi
-  rm -rf "$directory"
 }
 
-generate_client_import() {
-  local uri
+generate_client_import() (
+  local uri export_directory
+  export_directory="$(mktemp -d "$ROOT_DIR/.client-export.XXXXXX")"
+  trap 'rm -rf -- "$export_directory"' EXIT
   uri="$(
     python3 - <<'PY'
 import os
@@ -195,39 +194,54 @@ name = urllib.parse.quote("Personal VPN - Vultr Osaka")
 print(f'vless://{values["VPN_UUID"]}@{values["PRIMARY_IP"]}:443?{query}#{name}')
 PY
   )"
-  printf '%s\n' "$uri" >"$ROOT_DIR/primary-ios.local.txt"
-  chmod 600 "$ROOT_DIR/primary-ios.local.txt"
+  printf '%s\n' "$uri" >"$export_directory/primary-ios.local.txt"
+  chmod 600 "$export_directory/primary-ios.local.txt"
   if command -v qrencode >/dev/null 2>&1; then
-    printf '%s' "$uri" | qrencode -o "$ROOT_DIR/primary-ios.local.png" -l Q -s 8
-    chmod 600 "$ROOT_DIR/primary-ios.local.png"
+    printf '%s' "$uri" | qrencode -o "$export_directory/primary-ios.local.png" -l Q -s 8
+    chmod 600 "$export_directory/primary-ios.local.png"
+    mv "$export_directory/primary-ios.local.png" "$ROOT_DIR/primary-ios.local.png"
+  else
+    rm -f "$ROOT_DIR/primary-ios.local.png"
   fi
-}
+  mv "$export_directory/primary-ios.local.txt" "$ROOT_DIR/primary-ios.local.txt"
+)
 
-for command in curl python3 ssh ssh-keygen ssh-agent ssh-add openssl awk sed tar sha256sum timeout; do
+[[ "$(uname -s)" == Linux ]] || die "Run this script on Linux or Ubuntu under WSL"
+for command in curl python3 ssh ssh-keygen ssh-agent ssh-add openssl awk sed tar sha256sum timeout flock; do
   require "$command"
 done
 
 umask 077
-touch "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-set -a
+if (( VERIFY_ONLY == 1 )); then
+  [[ -f "$ENV_FILE" ]] || die "Verification requires an existing $ENV_FILE"
+else
+  exec {ENV_LOCK_FD}>"$ENV_FILE.lock"
+  flock -n "$ENV_LOCK_FD" || die "Another lifecycle operation is using $ENV_FILE"
+  touch "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+fi
 # shellcheck source=/dev/null
 source "$ENV_FILE"
-set +a
+export -n VULTR_API_KEY
 
 if [[ -z "${VULTR_API_KEY:-}" ]]; then
+  (( VERIFY_ONLY == 0 )) || die "Verification requires a saved VULTR_API_KEY"
   [[ -t 0 ]] || die "Set VULTR_API_KEY in $ENV_FILE"
   read -rsp 'Vultr API key: ' VULTR_API_KEY
   printf '\n'
   set_env VULTR_API_KEY "$VULTR_API_KEY"
-  export VULTR_API_KEY
 fi
 
 if [[ -z "${REALITY_TARGET:-}" ]]; then
+  (( VERIFY_ONLY == 0 )) || die "Verification requires a saved REALITY_TARGET"
   [[ -t 0 ]] || die "Set REALITY_TARGET in $ENV_FILE"
   read -rp 'REALITY target hostname: ' REALITY_TARGET
+fi
+[[ "$REALITY_TARGET" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ &&
+    "${#REALITY_TARGET}" -le 253 && "$REALITY_TARGET" == *.* ]] ||
+  die "REALITY_TARGET must be a hostname without a scheme, path, or whitespace"
+if (( VERIFY_ONLY == 0 )); then
   set_env REALITY_TARGET "$REALITY_TARGET"
-  export REALITY_TARGET
 fi
 
 REGION="${VULTR_REGION:-itm}"
@@ -240,30 +254,71 @@ SSH_KEY_NAME="${VULTR_SSH_KEY_NAME:-travel-2026}"
 XRAY_VERSION="${XRAY_VERSION:-v26.7.28}"
 SKIP_REBOOT="${BRING_UP_SKIP_REBOOT:-0}"
 SKIP_CLIENT_TEST="${BRING_UP_SKIP_CLIENT_TEST:-0}"
+STORED_INSTANCE_ID="${VULTR_INSTANCE_ID:-}"
+export REALITY_TARGET REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY VPN_UUID REALITY_SHORT_ID
 
-[[ "$LABEL" == personal-vpn-* ]] ||
+[[ "$LABEL" =~ ^personal-vpn-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
   die "Instance label must stay inside the personal-vpn- namespace: $LABEL"
+[[ "$XRAY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid XRAY_VERSION"
+[[ "$OS_ID" =~ ^[1-9][0-9]*$ ]] || die "Invalid VULTR_OS_ID"
+[[ "$REGION" =~ ^[A-Za-z0-9-]+$ && "$PLAN" =~ ^[A-Za-z0-9-]+$ &&
+    "$HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] ||
+  die "Invalid region, plan, or hostname"
+[[ "$SKIP_REBOOT" =~ ^[01]$ && "$SKIP_CLIENT_TEST" =~ ^[01]$ ]] ||
+  die "BRING_UP_SKIP_REBOOT and BRING_UP_SKIP_CLIENT_TEST must be 0 or 1"
+validate_api_key
+CREDENTIAL_COUNT=0
+for value in "${REALITY_PRIVATE_KEY:-}" "${REALITY_PUBLIC_KEY:-}" "${VPN_UUID:-}" "${REALITY_SHORT_ID:-}"; do
+  if [[ -n "$value" ]]; then
+    ((CREDENTIAL_COUNT += 1))
+  fi
+done
+[[ "$CREDENTIAL_COUNT" == 0 || "$CREDENTIAL_COUNT" == 4 ]] ||
+  die "Incomplete REALITY credentials; restore the complete set before continuing"
+if (( VERIFY_ONLY == 1 || CREDENTIAL_COUNT == 4 )); then
+  validate_reality_credentials
+fi
+
+RUN_DIR="$(mktemp -d)"
+readonly RUN_DIR
+ASKPASS="$RUN_DIR/askpass"
+AGENT_STARTED=0
+CLIENT_PID=""
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$CLIENT_PID" ]]; then
+    wait "$CLIENT_PID" || :
+  fi
+  if (( AGENT_STARTED == 1 )); then
+    if ! ssh-agent -k >/dev/null 2>&1; then
+      printf 'WARNING: Could not stop the temporary SSH agent.\n' >&2
+    fi
+  fi
+  rm -rf -- "$RUN_DIR"
+  if (( status != 0 )); then
+    printf 'ERROR: Setup stopped during %s (exit %s). Check Vultr for billable resources.\n' \
+      "${STAGE:-startup}" "$status" >&2
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+cat >"$ASKPASS" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$SSH_KEY_PASSPHRASE"
+EOF
+chmod 700 "$ASKPASS"
 
 log "Checking Vultr API access"
-if ! ACCOUNT_JSON="$(api_get /account)"; then
-  CURRENT_IP="$(curl -fsS https://api.ipify.org 2>/dev/null || echo unknown)"
-  die "Vultr API access failed. Allow ${CURRENT_IP}/32 under Account > API > Access Control."
-fi
-REMAINING="$(
-  python3 -c '
-import decimal, json, sys
-account = json.load(sys.stdin)["account"]
-balance = decimal.Decimal(str(account["balance"]))
-pending = decimal.Decimal(str(account["pending_charges"]))
-print(max(decimal.Decimal("0"), -balance - pending))
-' <<<"$ACCOUNT_JSON"
-)"
+ACCOUNT_JSON="$(api_get /account)"
+ACCOUNT_VALUES="$(vultr_json account <<<"$ACCOUNT_JSON")"
+read -r _ REMAINING <<<"$ACCOUNT_VALUES"
 log "Remaining Vultr credit: \$$REMAINING"
 
 log "Checking REALITY target"
 TLS_OUTPUT="$(
-  openssl s_client -connect "$REALITY_TARGET:443" -servername "$REALITY_TARGET" \
-    -tls1_3 -alpn h2 </dev/null 2>&1 || true
+  timeout 20s openssl s_client -connect "$REALITY_TARGET:443" -servername "$REALITY_TARGET" \
+    -tls1_3 -alpn h2 </dev/null 2>&1
 )"
 grep -q 'TLSv1.3' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET does not negotiate TLS 1.3"
 grep -q 'ALPN protocol: h2' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET does not negotiate HTTP/2"
@@ -274,46 +329,47 @@ TARGET_HTTP="$(
 [[ "$TARGET_HTTP" == "200" ]] || die "$REALITY_TARGET returned HTTP $TARGET_HTTP instead of 200"
 
 if [[ ! -f "$SSH_KEY_PATH" ]]; then
+  (( VERIFY_ONLY == 0 )) || die "Verification requires the existing SSH key: $SSH_KEY_PATH"
   log "Generating encrypted SSH key"
   install -d -m 700 "$(dirname "$SSH_KEY_PATH")"
   SSH_KEY_PASSPHRASE="${SSH_KEY_PASSPHRASE:-$(openssl rand -base64 24 | tr -d '\n')}"
-  ssh-keygen -q -t ed25519 -C "$SSH_KEY_NAME" -f "$SSH_KEY_PATH" -N "$SSH_KEY_PASSPHRASE"
-  set_env SSH_KEY_PASSPHRASE "$SSH_KEY_PASSPHRASE"
   export SSH_KEY_PASSPHRASE
+  DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force \
+    ssh-keygen -q -t ed25519 -C "$SSH_KEY_NAME" -f "$SSH_KEY_PATH" </dev/null
+  set_env SSH_KEY_PASSPHRASE "$SSH_KEY_PASSPHRASE"
 fi
-[[ -f "$SSH_KEY_PATH.pub" ]] || die "Missing public key: $SSH_KEY_PATH.pub"
+if (( VERIFY_ONLY == 0 )); then
+  [[ -f "$SSH_KEY_PATH.pub" ]] || die "Missing public key: $SSH_KEY_PATH.pub"
+fi
 
 if [[ -z "${SSH_KEY_PASSPHRASE+x}" ]]; then
   if ssh-keygen -y -P '' -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
     SSH_KEY_PASSPHRASE=""
   else
+    (( VERIFY_ONLY == 0 )) || die "Verification requires the saved SSH key passphrase"
     [[ -t 0 ]] || die "Set SSH_KEY_PASSPHRASE in $ENV_FILE"
     read -rsp 'SSH key passphrase: ' SSH_KEY_PASSPHRASE
     printf '\n'
     set_env SSH_KEY_PASSPHRASE "$SSH_KEY_PASSPHRASE"
   fi
-  export SSH_KEY_PASSPHRASE
 fi
+export SSH_KEY_PASSPHRASE
 
-ASKPASS="$(mktemp)"
-cat >"$ASKPASS" <<'EOF'
-#!/bin/sh
-printf '%s\n' "$SSH_KEY_PASSPHRASE"
-EOF
-chmod 700 "$ASKPASS"
-eval "$(ssh-agent -s)" >/dev/null
-cleanup() {
-  ssh-agent -k >/dev/null 2>&1 || true
-  rm -f "$ASKPASS"
-}
-trap cleanup EXIT
+AGENT_OUTPUT="$(ssh-agent -a "$RUN_DIR/agent.sock" -s)"
+SSH_AGENT_PID="$(sed -n 's/^SSH_AGENT_PID=\([0-9][0-9]*\);.*/\1/p' <<<"$AGENT_OUTPUT")"
+[[ "$SSH_AGENT_PID" =~ ^[0-9]+$ ]] || die "Could not read the temporary SSH agent PID"
+SSH_AUTH_SOCK="$RUN_DIR/agent.sock"
+export SSH_AUTH_SOCK SSH_AGENT_PID
+AGENT_STARTED=1
 DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force \
-  ssh-add "$SSH_KEY_PATH" </dev/null >/dev/null 2>&1
+  ssh-add "$SSH_KEY_PATH" </dev/null >/dev/null 2>&1 ||
+  die "Could not unlock the SSH key; check SSH_KEY_PASSPHRASE"
 
-PUBLIC_KEY="$(<"$SSH_KEY_PATH.pub")"
-SSH_KEYS_JSON="$(api_get '/ssh-keys?per_page=500')"
-mapfile -t KEY_MATCH < <(
-  PUBLIC_KEY="$PUBLIC_KEY" python3 -c '
+if (( VERIFY_ONLY == 0 )); then
+  PUBLIC_KEY="$(<"$SSH_KEY_PATH.pub")"
+  SSH_KEYS_JSON="$(api_list /ssh-keys ssh_keys)"
+  KEY_MATCH_ROWS="$(
+    PUBLIC_KEY="$PUBLIC_KEY" python3 -c '
 import json, os, sys
 matches = [
     item for item in json.load(sys.stdin)["ssh_keys"]
@@ -323,31 +379,33 @@ print(len(matches))
 if len(matches) == 1:
     print(matches[0]["id"])
 ' <<<"$SSH_KEYS_JSON"
-)
+  )"
+  mapfile -t KEY_MATCH <<<"$KEY_MATCH_ROWS"
 
-case "${KEY_MATCH[0]}" in
-  0)
-    log "Uploading SSH public key"
-    KEY_DATA="$(
-      PUBLIC_KEY="$PUBLIC_KEY" SSH_KEY_NAME="$SSH_KEY_NAME" python3 -c '
+  case "${KEY_MATCH[0]}" in
+    0)
+      log "Uploading SSH public key"
+      KEY_DATA="$(
+        PUBLIC_KEY="$PUBLIC_KEY" SSH_KEY_NAME="$SSH_KEY_NAME" python3 -c '
 import json, os
 print(json.dumps({"name": os.environ["SSH_KEY_NAME"], "ssh_key": os.environ["PUBLIC_KEY"]}))
 '
-    )"
-    KEY_RESPONSE="$(api_post /ssh-keys "$KEY_DATA")"
-    VULTR_SSH_KEY_ID="$(
-      python3 -c 'import json,sys; print(json.load(sys.stdin)["ssh_key"]["id"])' <<<"$KEY_RESPONSE"
-    )"
-    ;;
-  1) VULTR_SSH_KEY_ID="${KEY_MATCH[1]}" ;;
-  *) die "The same SSH public key appears more than once in Vultr" ;;
-esac
-set_env VULTR_SSH_KEY_ID "$VULTR_SSH_KEY_ID"
-export VULTR_SSH_KEY_ID
+      )"
+      KEY_RESPONSE="$(api_post /ssh-keys "$KEY_DATA")"
+      VULTR_SSH_KEY_ID="$(
+        vultr_json id ssh_key <<<"$KEY_RESPONSE"
+      )"
+      ;;
+    1) VULTR_SSH_KEY_ID="${KEY_MATCH[1]}" ;;
+    *) die "The same SSH public key appears more than once in Vultr" ;;
+  esac
+  set_env VULTR_SSH_KEY_ID "$VULTR_SSH_KEY_ID"
+  export VULTR_SSH_KEY_ID
+fi
 
 log "Finding Vultr instance"
-INSTANCES_JSON="$(api_get '/instances?per_page=500')"
-mapfile -t INSTANCE_MATCH < <(
+INSTANCES_JSON="$(api_list /instances instances)"
+INSTANCE_MATCH_ROWS="$(
   python3 -c '
 import json, sys
 label = sys.argv[1]
@@ -360,7 +418,8 @@ if len(matches) == 1:
     print(item["plan"])
     print(item["os_id"])
 ' "$LABEL" <<<"$INSTANCES_JSON"
-)
+)"
+mapfile -t INSTANCE_MATCH <<<"$INSTANCE_MATCH_ROWS"
 
 NEW_INSTANCE=0
 case "${INSTANCE_MATCH[0]}" in
@@ -388,8 +447,7 @@ PY
     )"
     INSTANCE_RESPONSE="$(api_post /instances "$INSTANCE_DATA")"
     VULTR_INSTANCE_ID="$(
-      python3 -c 'import json,sys; print(json.load(sys.stdin)["instance"]["id"])' \
-        <<<"$INSTANCE_RESPONSE"
+      vultr_json id instance <<<"$INSTANCE_RESPONSE"
     )"
     NEW_INSTANCE=1
     ;;
@@ -401,26 +459,30 @@ PY
     ;;
   *) die "More than one instance is named $LABEL" ;;
 esac
+if (( VERIFY_ONLY == 1 )) && [[ -n "$STORED_INSTANCE_ID" && "$STORED_INSTANCE_ID" != "$VULTR_INSTANCE_ID" ]]; then
+  die "Stored instance ID does not match the configured label"
+fi
 
-set_env VULTR_INSTANCE_ID "$VULTR_INSTANCE_ID"
-set_env VULTR_INSTANCE_LABEL "$LABEL"
-set_env VULTR_REGION "$REGION"
-set_env VULTR_PLAN "$PLAN"
-set_env VULTR_OS_ID "$OS_ID"
+if (( VERIFY_ONLY == 0 )); then
+  set_env VULTR_INSTANCE_ID "$VULTR_INSTANCE_ID"
+  set_env VULTR_INSTANCE_LABEL "$LABEL"
+  set_env VULTR_REGION "$REGION"
+  set_env VULTR_PLAN "$PLAN"
+  set_env VULTR_OS_ID "$OS_ID"
+fi
 export VULTR_INSTANCE_ID
 
 START_REQUESTED=0
 for _ in $(seq 1 90); do
   INSTANCE_RESPONSE="$(api_get "/instances/$VULTR_INSTANCE_ID")"
-  read -r STATUS POWER SERVER_STATUS PRIMARY_IP < <(
-    python3 -c '
-import json, sys
-item = json.load(sys.stdin)["instance"]
-print(item["status"], item["power_status"], item["server_status"], item["main_ip"])
-' <<<"$INSTANCE_RESPONSE"
-  )
+  INSTANCE_STATE="$(vultr_json instance "$VULTR_INSTANCE_ID" <<<"$INSTANCE_RESPONSE")"
+  read -r STATUS POWER SERVER_STATUS PRIMARY_IP <<<"$INSTANCE_STATE"
+  if (( VERIFY_ONLY == 1 )) && [[ "$STATUS/$POWER/$SERVER_STATUS" != active/running/ok ]]; then
+    die "Instance is not ready; verification will not start or modify it"
+  fi
   if [[ "$STATUS" == "active" && "$POWER" == "stopped" &&
-        "$START_REQUESTED" == "0" ]]; then
+        "$SERVER_STATUS" == "ok" && "$START_REQUESTED" == "0" &&
+        "$NEW_INSTANCE" == "0" && "$VERIFY_ONLY" == "0" ]]; then
     api_post_empty "/instances/$VULTR_INSTANCE_ID/start"
     START_REQUESTED=1
   fi
@@ -435,7 +497,9 @@ done
   die "Instance did not become ready"
 [[ "$PRIMARY_IP" =~ ^[0-9]+(\.[0-9]+){3}$ && "$PRIMARY_IP" != "0.0.0.0" ]] ||
   die "Instance returned an invalid IPv4 address: $PRIMARY_IP"
-set_env PRIMARY_IP "$PRIMARY_IP"
+if (( VERIFY_ONLY == 0 )); then
+  set_env PRIMARY_IP "$PRIMARY_IP"
+fi
 export PRIMARY_IP
 
 if (( NEW_INSTANCE == 1 )); then
@@ -443,21 +507,48 @@ if (( NEW_INSTANCE == 1 )); then
 fi
 
 SSH_OPTIONS=(
-  -o StrictHostKeyChecking=accept-new
+  -o BatchMode=yes
+  -o IdentitiesOnly=yes
   -o ConnectTimeout=10
   -o ServerAliveInterval=15
   -i "$SSH_KEY_PATH"
 )
+if (( VERIFY_ONLY == 1 )); then
+  SSH_OPTIONS+=(-o StrictHostKeyChecking=yes -o UpdateHostKeys=no)
+else
+  SSH_OPTIONS+=(-o StrictHostKeyChecking=accept-new)
+fi
 
 log "Waiting for SSH"
-wait_for_ssh root
+if (( VERIFY_ONLY == 1 )); then
+  wait_for_ssh ops
+else
+  wait_for_ssh root
+fi
+if (( VERIFY_ONLY == 0 && NEW_INSTANCE == 0 && CREDENTIAL_COUNT == 0 )); then
+  EXISTING_PROXY="$(
+    ssh "${SSH_OPTIONS[@]}" "root@$PRIMARY_IP" 'python3 -' <<'PY'
+import json
+from pathlib import Path
+
+config_path = Path("/usr/local/etc/xray/config.json")
+contents = config_path.read_text() if config_path.exists() else ""
+config = json.loads(contents) if contents.strip() else {}
+configured = any(item.get("protocol") == "vless" for item in config.get("inbounds", []))
+print("yes" if configured else "no")
+PY
+  )"
+  [[ "$EXISTING_PROXY" == no ]] ||
+    die "Existing VLESS configuration found; restore its credentials instead of rotating them implicitly"
+fi
 
 if (( VERIFY_ONLY == 0 )); then
   log "Hardening Ubuntu"
   ssh "${SSH_OPTIONS[@]}" "root@$PRIMARY_IP" 'bash -se' <<'REMOTE'
+set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-cloud-init status --wait >/dev/null 2>&1 || true
+cloud-init status --wait
 apt-get update -qq
 apt-get upgrade -y -qq
 timedatectl set-timezone UTC
@@ -470,7 +561,16 @@ usermod -aG sudo ops
 printf '%s\n' 'ops ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/ops
 chmod 440 /etc/sudoers.d/ops
 visudo -cf /etc/sudoers.d/ops >/dev/null
+REMOTE
 
+  wait_for_ssh ops
+  [[ "$(ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo whoami')" == root ]] ||
+    die "ops sudo verification failed; SSH policy has not been changed"
+
+  ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' <<'REMOTE'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 cat >/etc/ssh/sshd_config.d/00-personal-vpn.conf <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -523,8 +623,9 @@ REMOTE
 
   log "Checking target from the server"
   ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' -- "$REALITY_TARGET" <<'REMOTE'
+set -euo pipefail
 target="$1"
-output="$(openssl s_client -connect "$target:443" -servername "$target" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
+output="$(timeout 20s openssl s_client -connect "$target:443" -servername "$target" -tls1_3 -alpn h2 </dev/null 2>&1)"
 grep -q 'TLSv1.3' <<<"$output" || {
   echo "FAIL: target does not negotiate TLS 1.3" >&2
   exit 1
@@ -546,21 +647,27 @@ REMOTE
   log "Installing Xray $XRAY_VERSION"
   ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' -- \
     "$XRAY_VERSION" "$XRAY_INSTALLER_COMMIT" "$XRAY_INSTALLER_SHA256" <<'REMOTE'
+set -euo pipefail
 version="$1"
 installer_commit="$2"
 installer_sha256="$3"
-installed="$(xray version 2>/dev/null | awk 'NR==1{print $2}' || true)"
+installed=""
+if command -v xray >/dev/null 2>&1; then
+  installed="$(xray version | awk 'NR==1{print $2}')"
+fi
 if [[ "v$installed" != "$version" ]]; then
-  curl -fsSL \
+  workdir="$(mktemp -d)"
+  trap 'rm -rf -- "$workdir"' EXIT
+  curl -qfsSL --connect-timeout 10 --max-time 120 \
     "https://raw.githubusercontent.com/XTLS/Xray-install/$installer_commit/install-release.sh" \
-    -o /tmp/xray-install.sh
-  actual_sha256="$(sha256sum /tmp/xray-install.sh | awk '{print $1}')"
+    -o "$workdir/install-release.sh"
+  actual_sha256="$(sha256sum "$workdir/install-release.sh" | awk '{print $1}')"
   [[ "$actual_sha256" == "$installer_sha256" ]] || {
     echo "FAIL: Xray installer checksum mismatch" >&2
     exit 1
   }
-  if ! TERM=xterm bash /tmp/xray-install.sh install --version "$version" >/tmp/xray-install.log 2>&1; then
-    cat /tmp/xray-install.log >&2
+  if ! TERM=xterm bash "$workdir/install-release.sh" install --version "$version" >"$workdir/install.log" 2>&1; then
+    cat "$workdir/install.log" >&2
     exit 1
   fi
 fi
@@ -572,6 +679,7 @@ REMOTE
     log "Generating REALITY credentials"
     CREDENTIALS="$(
       ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' <<'REMOTE'
+set -euo pipefail
 keys="$(xray x25519)"
 private="$(awk '/^PrivateKey:/{print $2}' <<<"$keys")"
 public="$(awk '/^Password/{print $3}' <<<"$keys")"
@@ -586,6 +694,7 @@ REMOTE
     REALITY_PUBLIC_KEY="${VALUES[1]}"
     VPN_UUID="${VALUES[2]}"
     REALITY_SHORT_ID="${VALUES[3]}"
+    validate_reality_credentials
     set_env REALITY_PRIVATE_KEY "$REALITY_PRIVATE_KEY"
     set_env REALITY_PUBLIC_KEY "$REALITY_PUBLIC_KEY"
     set_env VPN_UUID "$VPN_UUID"
@@ -662,21 +771,26 @@ PY
   )"
   printf '%s\n' "$CONFIG" |
     ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" \
-      'sudo tee /usr/local/etc/xray/config.json >/dev/null'
+      'sudo install -m 600 /dev/stdin /usr/local/etc/xray/config.json.pending'
   ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' <<'REMOTE'
+set -euo pipefail
+test_log="$(mktemp)"
+trap 'rm -f /usr/local/etc/xray/config.json.pending "$test_log"' EXIT
 service_user="$(systemctl show xray -p User --value)"
 service_user="${service_user:-root}"
-service_group="$(id -gn "$service_user")"
-chown "root:$service_group" /usr/local/etc/xray/config.json
-chmod 640 /usr/local/etc/xray/config.json
-if ! sudo -u "$service_user" xray run -test -c /usr/local/etc/xray/config.json >/tmp/xray-test.log 2>&1; then
-  cat /tmp/xray-test.log >&2
+service_group="$(systemctl show xray -p Group --value)"
+service_group="${service_group:-$(id -gn "$service_user")}"
+chown "root:$service_group" /usr/local/etc/xray/config.json.pending
+chmod 640 /usr/local/etc/xray/config.json.pending
+if ! sudo -u "$service_user" -g "$service_group" xray run -test -c /usr/local/etc/xray/config.json.pending >"$test_log" 2>&1; then
+  cat "$test_log" >&2
   exit 1
 fi
-grep -q 'Configuration OK.' /tmp/xray-test.log || {
-  cat /tmp/xray-test.log >&2
+grep -q 'Configuration OK.' "$test_log" || {
+  cat "$test_log" >&2
   exit 1
 }
+mv /usr/local/etc/xray/config.json.pending /usr/local/etc/xray/config.json
 systemctl enable --now xray >/dev/null
 systemctl restart xray
 REMOTE
@@ -709,6 +823,7 @@ fi
 
 log "Verifying server"
 ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' <<'REMOTE'
+set -euo pipefail
 for _ in $(seq 1 30); do
   [[ "$(timedatectl show -p NTPSynchronized --value)" == "yes" ]] && break
   sleep 2
@@ -749,7 +864,7 @@ HTTPS_CODE="$(
 )"
 [[ "$HTTPS_CODE" == "200" ]] || die "Camouflage HTTPS returned $HTTPS_CODE"
 CERTIFICATE_OUTPUT="$(
-  openssl s_client -connect "$PRIMARY_IP:443" -servername "$REALITY_TARGET" </dev/null 2>&1
+  timeout 20s openssl s_client -connect "$PRIMARY_IP:443" -servername "$REALITY_TARGET" </dev/null 2>&1
 )"
 grep -q 'Verify return code: 0 (ok)' <<<"$CERTIFICATE_OUTPUT" ||
   die "Camouflage certificate validation failed"
@@ -759,9 +874,13 @@ if [[ "$SKIP_CLIENT_TEST" != "1" ]]; then
   test_reality_client
 fi
 
-generate_client_import
+if (( VERIFY_ONLY == 0 || EXPORT_CLIENT == 1 )); then
+  generate_client_import
+fi
 log "READY label=$LABEL ip=$PRIMARY_IP"
-log "Client import: $ROOT_DIR/primary-ios.local.txt"
-if [[ -f "$ROOT_DIR/primary-ios.local.png" ]]; then
-  log "QR code: $ROOT_DIR/primary-ios.local.png"
+if (( VERIFY_ONLY == 0 || EXPORT_CLIENT == 1 )); then
+  log "Client import: $ROOT_DIR/primary-ios.local.txt"
+  if [[ -f "$ROOT_DIR/primary-ios.local.png" ]]; then
+    log "QR code: $ROOT_DIR/primary-ios.local.png"
+  fi
 fi

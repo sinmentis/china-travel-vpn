@@ -1,0 +1,9 @@
+title = "China Travel VPN"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public SHA-256 digest of the pinned Xray installer, not an identity token"
+regexTarget = "secret"
+regexes = ['''^7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555$''']

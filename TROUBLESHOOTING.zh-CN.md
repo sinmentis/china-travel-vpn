@@ -13,7 +13,7 @@
 | 确实要换一台机器 | [替换服务器](#replace-server) |
 
 把 `SERVER_IP` 换成公网 IPv4。下面的服务器命令按 `ops` 登录后使用 `sudo` 写。
-脚本的 `--verify-only` 会做什么、有什么副作用，在[脚本部署页](docs/quickstart.zh-CN.md)有说明。
+脚本的只读 `--verify-only` 模式和单独的导出选项，在[脚本部署页](docs/quickstart.zh-CN.md)有说明。
 
 <a id="server-state"></a>
 
@@ -174,7 +174,7 @@ ENV_FILE=.env.vultr ./scripts/bring-down.sh --yes
 
 ```bash
 mv .env.replacement .env.vultr
-./scripts/bring-up.sh --verify-only
+./scripts/bring-up.sh --verify-only --export-client
 ```
 
 如果只是拿旧标签重新跑 `bring-up.sh`，它会复用旧实例，不会申请新地址。

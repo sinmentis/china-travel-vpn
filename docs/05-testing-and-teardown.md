@@ -52,6 +52,9 @@ incurred or delete separately billed storage and snapshots.
 
 The teardown script keeps reusable SSH and REALITY credentials. Revoke the API
 key when you no longer need automation.
+Its dry run leaves local files untouched, including when no instance is found.
+Local instance records are removed only after a confirmed deletion or explicit
+`--yes` cleanup of an already absent instance.
 
 ## Trial credit needs a deadline
 
@@ -61,11 +64,18 @@ displayed expiry date; if no timezone is given, leave extra margin.
 
 The [credit guard](../scripts/vultr-credit-guard.sh) checks remaining credit
 against `CREDIT_GUARD_MIN_REMAINING` (default `$1`) and a required UTC
-`CREDIT_GUARD_DEADLINE`. It only targets instance labels beginning with the
+`CREDIT_GUARD_DEADLINE` in ISO 8601 form (`YYYY-MM-DDTHH:MM:SSZ`).
+It only targets instance labels beginning with the
 configured `personal-vpn-` prefix. It does not manage other billable resources.
 
 The script makes one check per run. Daily scheduling requires a separate
 systemd timer or cron job on a machine that stays online; `bring-up.sh` does
 not install that schedule. API access must keep working. Use
-`CREDIT_GUARD_DRY_RUN=1` when trying the guard, and treat it as a precaution,
-not a provider-enforced spending cap.
+`CREDIT_GUARD_DRY_RUN=1` when trying the guard; previews do not overwrite the
+last real-run status. Invalid API data causes an error rather than being
+treated as an empty account. This remains a precaution, not a provider-enforced
+spending cap.
+
+Once the configured deadline has passed, deletion no longer depends on the
+balance endpoint. The instance list must still be valid. A simulated clock
+(`CREDIT_GUARD_NOW_EPOCH`) is accepted only in dry-run mode.

@@ -48,6 +48,8 @@
 
 销毁脚本会保留可复用的 SSH 和 REALITY 凭据。
 以后不再需要自动化时，把 API key 撤销。
+预览不会改本地文件，找不到实例时也一样。
+只有确认删除成功，或显式用 `--yes` 清理已不存在的实例记录，才会清理本地状态。
 
 ## 赠金要看到期日
 
@@ -56,8 +58,14 @@ Vultr 关机仍然收费。赠金会过期，也不代表账号变成了用完�
 
 [余额保护脚本](../scripts/vultr-credit-guard.sh)会检查剩余额度是否达到
 `CREDIT_GUARD_MIN_REMAINING`（默认 `$1`），或是否已到必填的 UTC 截止时间
-`CREDIT_GUARD_DEADLINE`。它只处理配置的 `personal-vpn-` 前缀实例，不管理其他计费资源。
+`CREDIT_GUARD_DEADLINE`，格式为 ISO 8601（`YYYY-MM-DDTHH:MM:SSZ`）。
+它只处理配置的 `personal-vpn-` 前缀实例，不管理其他计费资源。
 
 脚本每运行一次只查一次。要每天执行，需要在一台持续在线的机器上另配 systemd timer 或 cron，
 `bring-up.sh` 不会安装这个定时任务。API 访问也必须一直有效。
-试运行时用 `CREDIT_GUARD_DRY_RUN=1`。它是防忘记的措施，不是云厂商强制执行的消费上限。
+试运行时用 `CREDIT_GUARD_DRY_RUN=1`，预览不会覆盖上一次实际运行的状态。
+API 数据异常会报错，不会当成空账号继续处理。
+它仍是防忘记的措施，不是云厂商强制执行的消费上限。
+
+已到配置的截止时间后，销毁不再依赖余额接口，但实例列表仍须有效。
+模拟时间（`CREDIT_GUARD_NOW_EPOCH`）只允许在预览模式使用。

@@ -22,6 +22,7 @@ credentials*
 .env
 .env.*
 .env.vultr
+.client-export.*
 
 # Client export formats that embed credentials
 *.subscription
@@ -35,3 +36,7 @@ hysteria2://*
 *~
 .idea/
 .vscode/
+
+# Python regression-test artifacts
+__pycache__/
+*.py[cod]

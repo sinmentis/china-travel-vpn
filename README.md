@@ -67,4 +67,16 @@ up `$300` in a month, but the unused credit still expires. The server does not
 then stop billing. [Destroy it when finished](docs/05-testing-and-teardown.md#teardown);
 shutting it down is not enough.
 
+## Working on the scripts
+
+The regression tests use fake API responses and temporary files. They do not
+need a Vultr account or create cloud resources.
+
+```bash
+python3 -m unittest discover -s tests -v
+shellcheck -x scripts/*.sh scripts/lib/*.sh
+```
+
+[CI](.github/workflows/ci.yml) also scans Git history for secrets.
+
 MIT license. See [LICENSE](LICENSE).

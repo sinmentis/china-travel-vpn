@@ -51,4 +51,15 @@ Vultr API 的设置，以及脚本会问的两个值。
 比金额更值得记住的是到期日。每月约 `$5` 的服务器用不完 `$300`，但剩下的赠金照样会过期，
 服务器也不会因此停止计费。[用完要销毁](docs/05-testing-and-teardown.zh-CN.md#teardown)，只关机不行。
 
+## 修改脚本
+
+回归测试使用假的 API 响应和临时文件，不需要 Vultr 账号，也不会创建云资源。
+
+```bash
+python3 -m unittest discover -s tests -v
+shellcheck -x scripts/*.sh scripts/lib/*.sh
+```
+
+[CI](.github/workflows/ci.yml) 还会扫描 Git 历史里的凭据。
+
 MIT 许可证，见 [LICENSE](LICENSE)。

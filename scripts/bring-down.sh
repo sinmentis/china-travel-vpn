@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env.vultr}"
 API="${VULTR_API:-https://api.vultr.com/v2}"
+# shellcheck source=scripts/lib/vultr.sh
+source "$ROOT_DIR/scripts/lib/vultr.sh"
 CONFIRMED=0
 DRY_RUN=0
 FORCE=0
@@ -13,6 +15,11 @@ for argument in "$@"; do
     --yes) CONFIRMED=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --force) FORCE=1 ;;
+    --help)
+      echo "Usage: $0 [--dry-run] [--yes] [--force]"
+      echo "Preview or permanently delete the configured managed instance."
+      exit 0
+      ;;
     *)
       echo "Usage: $0 [--dry-run] [--yes] [--force]" >&2
       exit 2
@@ -23,12 +30,6 @@ done
 die() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
-}
-
-api_get() {
-  curl --fail-with-body -sS \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "$VULTR_API_KEY") \
-    "$API$1"
 }
 
 remove_runtime_values() {
@@ -43,19 +44,29 @@ remove_runtime_values() {
 }
 
 [[ -f "$ENV_FILE" ]] || die "Missing $ENV_FILE"
+for command in curl python3 flock; do
+  command -v "$command" >/dev/null 2>&1 || die "Missing command: $command"
+done
+umask 077
+if (( DRY_RUN == 0 )); then
+  exec {ENV_LOCK_FD}>"$ENV_FILE.lock"
+  flock -n "$ENV_LOCK_FD" || die "Another lifecycle operation is using $ENV_FILE"
+fi
 unset VULTR_API_KEY VULTR_INSTANCE_LABEL VULTR_INSTANCE_ID PRIMARY_IP
-set -a
 # shellcheck source=/dev/null
 source "$ENV_FILE"
-set +a
-: "${VULTR_API_KEY:?VULTR_API_KEY is required}"
+export -n VULTR_API_KEY
+validate_api_key
 
 LABEL="${VULTR_INSTANCE_LABEL:-personal-vpn-primary}"
 STORED_INSTANCE_ID="${VULTR_INSTANCE_ID:-}"
-[[ "$LABEL" == personal-vpn-* ]] ||
+[[ "$LABEL" =~ ^personal-vpn-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
   die "Refusing to destroy a label outside the personal-vpn- namespace: $LABEL"
-INSTANCES_JSON="$(api_get '/instances?per_page=500')"
-mapfile -t TARGETS < <(
+if [[ -n "$STORED_INSTANCE_ID" ]]; then
+  vultr_json validate-id "$STORED_INSTANCE_ID" >/dev/null
+fi
+INSTANCES_JSON="$(api_list /instances instances)"
+TARGET_ROWS="$(
   python3 -c '
 import json, sys
 label = sys.argv[1]
@@ -63,11 +74,21 @@ for instance in json.load(sys.stdin)["instances"]:
     if instance.get("label") == label:
         print(instance["id"] + "\t" + instance["main_ip"])
 ' "$LABEL" <<<"$INSTANCES_JSON"
-)
+)"
+TARGETS=()
+if [[ -n "$TARGET_ROWS" ]]; then
+  mapfile -t TARGETS <<<"$TARGET_ROWS"
+fi
 
 if ((${#TARGETS[@]} == 0)); then
-  remove_runtime_values
-  rm -f "$ROOT_DIR/primary-ios.local.txt" "$ROOT_DIR/primary-ios.local.png"
+  if [[ -n "$STORED_INSTANCE_ID" && "$FORCE" == "0" ]]; then
+    PRESENT="$(vultr_json has-instance "$STORED_INSTANCE_ID" <<<"$INSTANCES_JSON")"
+    [[ "$PRESENT" == no ]] || die "Stored instance still exists with a different label; refusing cleanup"
+  fi
+  if (( DRY_RUN == 0 && CONFIRMED == 1 )); then
+    remove_runtime_values
+    rm -f "$ROOT_DIR/primary-ios.local.txt" "$ROOT_DIR/primary-ios.local.png"
+  fi
   printf 'No instance named %s exists.\n' "$LABEL"
   exit 0
 fi
@@ -76,7 +97,7 @@ fi
 IFS=$'\t' read -r INSTANCE_ID INSTANCE_IP <<<"${TARGETS[0]}"
 if [[ -n "$STORED_INSTANCE_ID" && "$STORED_INSTANCE_ID" != "$INSTANCE_ID" &&
       "$FORCE" != "1" ]]; then
-  die "Stored instance ID does not match Vultr. Run bring-up --verify-only or use --force."
+  die "Stored instance ID does not match Vultr. Inspect the target before using --force."
 fi
 
 if (( DRY_RUN == 1 )); then
@@ -90,28 +111,13 @@ if (( CONFIRMED == 0 )); then
   [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 0
 fi
 
-HTTP_CODE="$(
-  curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "$VULTR_API_KEY") \
-    "$API/instances/$INSTANCE_ID"
-)"
-[[ "$HTTP_CODE" == "204" ]] || die "Vultr returned HTTP $HTTP_CODE"
+delete_instance "$INSTANCE_ID"
 
-for _ in $(seq 1 60); do
-  INSTANCES_JSON="$(api_get '/instances?per_page=500')"
-  COUNT="$(
-    python3 -c '
-import json, sys
-label = sys.argv[1]
-print(sum(item.get("label") == label for item in json.load(sys.stdin)["instances"]))
-' "$LABEL" <<<"$INSTANCES_JSON"
-  )"
-  [[ "$COUNT" == "0" ]] && break
-  sleep 5
-done
-[[ "$COUNT" == "0" ]] || die "Instance deletion did not complete"
-
-ssh-keygen -R "$INSTANCE_IP" >/dev/null 2>&1 || true
+if [[ -n "$INSTANCE_IP" ]] && command -v ssh-keygen >/dev/null 2>&1; then
+  if ! ssh-keygen -R "$INSTANCE_IP" >/dev/null 2>&1; then
+    printf 'WARNING: Could not remove the old SSH host-key entry.\n' >&2
+  fi
+fi
 remove_runtime_values
 rm -f "$ROOT_DIR/primary-ios.local.txt" "$ROOT_DIR/primary-ios.local.png"
 printf 'Destroyed %s. Reusable SSH and REALITY credentials were kept.\n' "$LABEL"
