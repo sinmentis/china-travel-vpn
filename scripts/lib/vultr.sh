@@ -54,7 +54,9 @@ api_get() {
 }
 
 api_post() {
-  api_request POST "$1" 201 "$2"
+  # Vultr answers 202 when it queues the create instead of completing it inline.
+  # The resource is billable either way, so both codes must count as success.
+  api_request POST "$1" 201,202 "$2"
 }
 
 api_post_empty() {

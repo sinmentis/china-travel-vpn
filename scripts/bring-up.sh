@@ -771,18 +771,18 @@ PY
   )"
   printf '%s\n' "$CONFIG" |
     ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" \
-      'sudo install -m 600 /dev/stdin /usr/local/etc/xray/config.json.pending'
+      'sudo install -m 600 /dev/stdin /usr/local/etc/xray/config.pending.json'
   ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' <<'REMOTE'
 set -euo pipefail
 test_log="$(mktemp)"
-trap 'rm -f /usr/local/etc/xray/config.json.pending "$test_log"' EXIT
+trap 'rm -f /usr/local/etc/xray/config.pending.json "$test_log"' EXIT
 service_user="$(systemctl show xray -p User --value)"
 service_user="${service_user:-root}"
 service_group="$(systemctl show xray -p Group --value)"
 service_group="${service_group:-$(id -gn "$service_user")}"
-chown "root:$service_group" /usr/local/etc/xray/config.json.pending
-chmod 640 /usr/local/etc/xray/config.json.pending
-if ! sudo -u "$service_user" -g "$service_group" xray run -test -c /usr/local/etc/xray/config.json.pending >"$test_log" 2>&1; then
+chown "root:$service_group" /usr/local/etc/xray/config.pending.json
+chmod 640 /usr/local/etc/xray/config.pending.json
+if ! sudo -u "$service_user" -g "$service_group" xray run -test -c /usr/local/etc/xray/config.pending.json >"$test_log" 2>&1; then
   cat "$test_log" >&2
   exit 1
 fi
@@ -790,7 +790,7 @@ grep -q 'Configuration OK.' "$test_log" || {
   cat "$test_log" >&2
   exit 1
 }
-mv /usr/local/etc/xray/config.json.pending /usr/local/etc/xray/config.json
+mv /usr/local/etc/xray/config.pending.json /usr/local/etc/xray/config.json
 systemctl enable --now xray >/dev/null
 systemctl restart xray
 REMOTE

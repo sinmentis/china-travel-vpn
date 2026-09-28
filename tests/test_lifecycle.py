@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -65,7 +66,7 @@ elif path == "/v2/ssh-keys":
         body = json.dumps({"ssh_keys": keys, "meta": {"links": {"next": ""}}})
 elif path == "/v2/instances" and method == "POST":
     created.touch()
-    status = 201
+    status = int(os.environ.get("TEST_CREATE_STATUS", "201"))
     body = json.dumps({"instance": {"id": "00000000-0000-4000-8000-000000000001"}})
 elif path == "/v2/instances":
     if scenario == "fresh" and not created.exists():
@@ -513,6 +514,22 @@ class BringUpTests(ScriptSandbox):
         self.assertIn("READY", result.stdout)
         self.assertFalse(any(call["url"].endswith("/start") for call in self.calls()))
 
+    def test_queued_create_is_treated_as_success(self):
+        self.environment["TEST_SCENARIO"] = "fresh"
+        self.environment["TEST_CREATE_STATUS"] = "202"
+        result = self.run_script("bring-up.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("READY", result.stdout)
+        self.assertIn("VULTR_INSTANCE_ID=", self.env_file.read_text())
+
+    def test_rejected_create_is_still_an_error(self):
+        self.environment["TEST_SCENARIO"] = "fresh"
+        self.environment["TEST_CREATE_STATUS"] = "200"
+        result = self.run_script("bring-up.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTP 200", result.stderr)
+        self.assertNotIn("READY", result.stdout)
+
     def test_fresh_account_generates_key_and_credentials(self):
         self.key.unlink()
         self.key.with_suffix(".pub").unlink()
@@ -603,6 +620,26 @@ class BringUpTests(ScriptSandbox):
         result = self.run_script("bring-up.sh")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls(), [])
+
+
+class RemoteScriptTests(unittest.TestCase):
+    """Guards details of the remote shell that the ssh stub cannot exercise."""
+
+    def test_staged_xray_config_keeps_a_json_extension(self):
+        source = (ROOT / "scripts" / "bring-up.sh").read_text()
+        staged = re.findall(r"xray run -test -c (\S+)", source)
+        self.assertTrue(staged)
+        for path in staged:
+            # Xray infers the config format from the extension and refuses
+            # to parse a staged file named anything else.
+            self.assertTrue(path.endswith(".json"), path)
+
+    def test_staged_xray_config_is_renamed_within_one_filesystem(self):
+        source = (ROOT / "scripts" / "bring-up.sh").read_text()
+        moves = re.findall(r"mv (\S+) (/usr/local/etc/xray/config\.json)", source)
+        self.assertTrue(moves)
+        for staged, live in moves:
+            self.assertEqual(str(Path(staged).parent), str(Path(live).parent))
 
 
 if __name__ == "__main__":
