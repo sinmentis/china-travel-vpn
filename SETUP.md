@@ -19,6 +19,10 @@ or SSH changes into a machine that already hosts something you care about.
 | 20–25 | [Client](docs/04-client-setup.md) | Your phone or computer uses the server's exit IP |
 | 26–28 | [Before and after the trip](docs/05-testing-and-teardown.md) | You know how to check, replace, and destroy it |
 
+Those pages build the REALITY route. To hide the server behind Cloudflare
+instead, replace step 14–19 with [CDN fronting](docs/06-cdn-fronting.md); the
+rest of the path is the same.
+
 `[LOCAL]` means the computer you are working from. Bash blocks need a Linux
 shell; Windows users can use Ubuntu under
 [WSL](https://learn.microsoft.com/windows/wsl/install), the Windows Subsystem

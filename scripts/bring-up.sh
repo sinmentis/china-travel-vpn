@@ -6,6 +6,8 @@ ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env.vultr}"
 API="${VULTR_API:-https://api.vultr.com/v2}"
 # shellcheck source=scripts/lib/vultr.sh
 source "$ROOT_DIR/scripts/lib/vultr.sh"
+# shellcheck source=scripts/lib/cloudflare.sh
+source "$ROOT_DIR/scripts/lib/cloudflare.sh"
 XRAY_INSTALLER_COMMIT="e741a4f56d368afbb9e5be3361b40c4552d3710d"
 XRAY_INSTALLER_SHA256="7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555"
 VERIFY_ONLY=0
@@ -50,10 +52,27 @@ validate_reality_credentials() {
     die "REALITY_PRIVATE_KEY is invalid"
   [[ "${REALITY_PUBLIC_KEY:-}" =~ ^[A-Za-z0-9_-]{43}$ ]] ||
     die "REALITY_PUBLIC_KEY is invalid"
-  [[ "${VPN_UUID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
-    die "VPN_UUID is invalid"
+  validate_uuid
   [[ "${REALITY_SHORT_ID:-}" =~ ^[0-9A-Fa-f]{16}$ ]] ||
     die "REALITY_SHORT_ID is invalid"
+}
+
+validate_uuid() {
+  [[ "${VPN_UUID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
+    die "VPN_UUID is invalid"
+}
+
+validate_cdn_credentials() {
+  validate_uuid
+  [[ "${CDN_WS_PATH:-}" =~ ^/[0-9a-f]{32}$ ]] || die "CDN_WS_PATH is invalid"
+}
+
+validate_credentials() {
+  if [[ "$TRANSPORT" == cdn ]]; then
+    validate_cdn_credentials
+  else
+    validate_reality_credentials
+  fi
 }
 
 set_env() {
@@ -79,7 +98,61 @@ wait_for_ssh() {
   die "SSH did not become ready for $user@$PRIMARY_IP"
 }
 
-test_reality_client() {
+cloudflare_ip_ranges() {
+  curl -qfsS --connect-timeout 10 --max-time 30 https://www.cloudflare.com/ips-v4 |
+    python3 -c '
+import ipaddress, sys
+networks = sorted({str(ipaddress.IPv4Network(entry, strict=True)) for entry in sys.stdin.read().split()})
+if not 5 <= len(networks) <= 100:
+    raise SystemExit("unexpected Cloudflare range count")
+print(", ".join(networks))
+'
+}
+
+# Behind the CDN the origin never sees visitors directly, so port 443 only has
+# to accept Cloudflare. Scanning the origin address then finds a closed port.
+nftables_config() {
+  local ingress="" sets=""
+  if [[ "$TRANSPORT" == cdn ]]; then
+    local ranges
+    ranges="$(cloudflare_ip_ranges)" || die "Could not read the Cloudflare IPv4 ranges"
+    sets="  set cloudflare {
+    type ipv4_addr
+    flags interval
+    elements = { $ranges }
+  }
+"
+    ingress="    tcp dport 443 ip saddr @cloudflare accept"
+  else
+    ingress="    tcp dport { 80, 443 } accept
+    udp dport 443 accept"
+  fi
+  cat <<EOF
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet filter {
+$sets  chain input {
+    type filter hook input priority 0; policy drop;
+
+    ct state established,related accept
+    ct state invalid drop
+    iif lo accept
+
+    tcp dport 22 accept
+$ingress
+
+    ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
+    ip6 nexthdr icmpv6 accept
+  }
+
+  chain forward { type filter hook forward priority 0; policy drop; }
+  chain output  { type filter hook output  priority 0; policy accept; }
+}
+EOF
+}
+
+test_tunnel_client() {
   local architecture asset metadata url digest directory binary port egress
   case "$(uname -m)" in
     x86_64) architecture="amd64" ;;
@@ -118,20 +191,23 @@ import json
 import os
 
 values = os.environ
-print(json.dumps({
-    "log": {"level": "warn"},
-    "inbounds": [{
-        "type": "socks",
-        "tag": "socks-in",
-        "listen": "127.0.0.1",
-        "listen_port": int(values["TEST_PORT"]),
-    }],
-    "outbounds": [{
-        "type": "vless",
-        "tag": "primary",
+if values["TRANSPORT"] == "cdn":
+    outbound = {
+        "server": values["CDN_DOMAIN"],
+        "tls": {
+            "enabled": True,
+            "server_name": values["CDN_DOMAIN"],
+            "utls": {"enabled": True, "fingerprint": "chrome"},
+        },
+        "transport": {
+            "type": "ws",
+            "path": values["CDN_WS_PATH"],
+            "headers": {"Host": values["CDN_DOMAIN"]},
+        },
+    }
+else:
+    outbound = {
         "server": values["PRIMARY_IP"],
-        "server_port": 443,
-        "uuid": values["VPN_UUID"],
         "flow": "xtls-rprx-vision",
         "tls": {
             "enabled": True,
@@ -143,7 +219,21 @@ print(json.dumps({
                 "short_id": values["REALITY_SHORT_ID"],
             },
         },
+    }
+print(json.dumps({
+    "log": {"level": "warn"},
+    "inbounds": [{
+        "type": "socks",
+        "tag": "socks-in",
+        "listen": "127.0.0.1",
+        "listen_port": int(values["TEST_PORT"]),
     }],
+    "outbounds": [dict({
+        "type": "vless",
+        "tag": "primary",
+        "server_port": 443,
+        "uuid": values["VPN_UUID"],
+    }, **outbound)],
 }, indent=2))
 PY
 
@@ -165,7 +255,7 @@ PY
   [[ "$client_status" == 124 ]] || die "The temporary sing-box client exited unexpectedly"
   if [[ "$egress" != "$PRIMARY_IP" ]]; then
     sed -n '1,80p' "$directory/client.log" >&2
-    die "Authenticated REALITY client test failed"
+    die "Authenticated $TRANSPORT client test failed"
   fi
 }
 
@@ -179,19 +269,36 @@ import os
 import urllib.parse
 
 values = os.environ
-query = urllib.parse.urlencode({
-    "encryption": "none",
-    "flow": "xtls-rprx-vision",
-    "security": "reality",
-    "sni": values["REALITY_TARGET"],
-    "fp": "chrome",
-    "pbk": values["REALITY_PUBLIC_KEY"],
-    "sid": values["REALITY_SHORT_ID"],
-    "type": "tcp",
-    "headerType": "none",
-})
-name = urllib.parse.quote("Personal VPN - Vultr Osaka")
-print(f'vless://{values["VPN_UUID"]}@{values["PRIMARY_IP"]}:443?{query}#{name}')
+if values["TRANSPORT"] == "cdn":
+    host = values["CDN_DOMAIN"]
+    label = "Personal VPN - Cloudflare"
+    # WebSocket carries no Vision flow; the CDN terminates the outer TLS.
+    fields = {
+        "encryption": "none",
+        "security": "tls",
+        "sni": host,
+        "fp": "chrome",
+        "type": "ws",
+        "host": host,
+        "path": values["CDN_WS_PATH"],
+    }
+else:
+    host = values["PRIMARY_IP"]
+    label = "Personal VPN - Vultr Osaka"
+    fields = {
+        "encryption": "none",
+        "flow": "xtls-rprx-vision",
+        "security": "reality",
+        "sni": values["REALITY_TARGET"],
+        "fp": "chrome",
+        "pbk": values["REALITY_PUBLIC_KEY"],
+        "sid": values["REALITY_SHORT_ID"],
+        "type": "tcp",
+        "headerType": "none",
+    }
+query = urllib.parse.urlencode(fields)
+name = urllib.parse.quote(label)
+print(f'vless://{values["VPN_UUID"]}@{host}:443?{query}#{name}')
 PY
   )"
   printf '%s\n' "$uri" >"$export_directory/primary-ios.local.txt"
@@ -232,16 +339,44 @@ if [[ -z "${VULTR_API_KEY:-}" ]]; then
   set_env VULTR_API_KEY "$VULTR_API_KEY"
 fi
 
-if [[ -z "${REALITY_TARGET:-}" ]]; then
-  (( VERIFY_ONLY == 0 )) || die "Verification requires a saved REALITY_TARGET"
-  [[ -t 0 ]] || die "Set REALITY_TARGET in $ENV_FILE"
-  read -rp 'REALITY target hostname: ' REALITY_TARGET
-fi
-[[ "$REALITY_TARGET" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ &&
-    "${#REALITY_TARGET}" -le 253 && "$REALITY_TARGET" == *.* ]] ||
-  die "REALITY_TARGET must be a hostname without a scheme, path, or whitespace"
+TRANSPORT="${TRANSPORT:-reality}"
+[[ "$TRANSPORT" == reality || "$TRANSPORT" == cdn ]] ||
+  die "TRANSPORT must be reality or cdn"
 if (( VERIFY_ONLY == 0 )); then
-  set_env REALITY_TARGET "$REALITY_TARGET"
+  set_env TRANSPORT "$TRANSPORT"
+fi
+
+if [[ "$TRANSPORT" == cdn ]]; then
+  if [[ -z "${CDN_DOMAIN:-}" ]]; then
+    (( VERIFY_ONLY == 0 )) || die "Verification requires a saved CDN_DOMAIN"
+    [[ -t 0 ]] || die "Set CDN_DOMAIN in $ENV_FILE"
+    read -rp 'Hostname to serve through Cloudflare: ' CDN_DOMAIN
+  fi
+  cloudflare_json validate-hostname "$CDN_DOMAIN" >/dev/null ||
+    die "CDN_DOMAIN must be a fully qualified hostname you control on Cloudflare"
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    (( VERIFY_ONLY == 0 )) || die "Verification requires a saved CLOUDFLARE_API_TOKEN"
+    [[ -t 0 ]] || die "Set CLOUDFLARE_API_TOKEN in $ENV_FILE"
+    read -rsp 'Cloudflare API token: ' CLOUDFLARE_API_TOKEN
+    printf '\n'
+  fi
+  validate_cloudflare_token
+  if (( VERIFY_ONLY == 0 )); then
+    set_env CDN_DOMAIN "$CDN_DOMAIN"
+    set_env CLOUDFLARE_API_TOKEN "$CLOUDFLARE_API_TOKEN"
+  fi
+else
+  if [[ -z "${REALITY_TARGET:-}" ]]; then
+    (( VERIFY_ONLY == 0 )) || die "Verification requires a saved REALITY_TARGET"
+    [[ -t 0 ]] || die "Set REALITY_TARGET in $ENV_FILE"
+    read -rp 'REALITY target hostname: ' REALITY_TARGET
+  fi
+  [[ "$REALITY_TARGET" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ &&
+      "${#REALITY_TARGET}" -le 253 && "$REALITY_TARGET" == *.* ]] ||
+    die "REALITY_TARGET must be a hostname without a scheme, path, or whitespace"
+  if (( VERIFY_ONLY == 0 )); then
+    set_env REALITY_TARGET "$REALITY_TARGET"
+  fi
 fi
 
 REGION="${VULTR_REGION:-itm}"
@@ -256,6 +391,8 @@ SKIP_REBOOT="${BRING_UP_SKIP_REBOOT:-0}"
 SKIP_CLIENT_TEST="${BRING_UP_SKIP_CLIENT_TEST:-0}"
 STORED_INSTANCE_ID="${VULTR_INSTANCE_ID:-}"
 export REALITY_TARGET REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY VPN_UUID REALITY_SHORT_ID
+export TRANSPORT CDN_DOMAIN CDN_WS_PATH
+export -n CLOUDFLARE_API_TOKEN
 
 [[ "$LABEL" =~ ^personal-vpn-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
   die "Instance label must stay inside the personal-vpn- namespace: $LABEL"
@@ -267,16 +404,24 @@ export REALITY_TARGET REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY VPN_UUID REALITY_SH
 [[ "$SKIP_REBOOT" =~ ^[01]$ && "$SKIP_CLIENT_TEST" =~ ^[01]$ ]] ||
   die "BRING_UP_SKIP_REBOOT and BRING_UP_SKIP_CLIENT_TEST must be 0 or 1"
 validate_api_key
+if [[ "$TRANSPORT" == cdn ]]; then
+  CREDENTIAL_FIELDS=("${VPN_UUID:-}" "${CDN_WS_PATH:-}")
+else
+  CREDENTIAL_FIELDS=(
+    "${REALITY_PRIVATE_KEY:-}" "${REALITY_PUBLIC_KEY:-}"
+    "${VPN_UUID:-}" "${REALITY_SHORT_ID:-}"
+  )
+fi
 CREDENTIAL_COUNT=0
-for value in "${REALITY_PRIVATE_KEY:-}" "${REALITY_PUBLIC_KEY:-}" "${VPN_UUID:-}" "${REALITY_SHORT_ID:-}"; do
+for value in "${CREDENTIAL_FIELDS[@]}"; do
   if [[ -n "$value" ]]; then
     ((CREDENTIAL_COUNT += 1))
   fi
 done
-[[ "$CREDENTIAL_COUNT" == 0 || "$CREDENTIAL_COUNT" == 4 ]] ||
-  die "Incomplete REALITY credentials; restore the complete set before continuing"
-if (( VERIFY_ONLY == 1 || CREDENTIAL_COUNT == 4 )); then
-  validate_reality_credentials
+[[ "$CREDENTIAL_COUNT" == 0 || "$CREDENTIAL_COUNT" == "${#CREDENTIAL_FIELDS[@]}" ]] ||
+  die "Incomplete $TRANSPORT credentials; restore the complete set before continuing"
+if (( VERIFY_ONLY == 1 || CREDENTIAL_COUNT == ${#CREDENTIAL_FIELDS[@]} )); then
+  validate_credentials
 fi
 
 RUN_DIR="$(mktemp -d)"
@@ -315,18 +460,23 @@ ACCOUNT_VALUES="$(vultr_json account <<<"$ACCOUNT_JSON")"
 read -r _ REMAINING <<<"$ACCOUNT_VALUES"
 log "Remaining Vultr credit: \$$REMAINING"
 
-log "Checking REALITY target"
-TLS_OUTPUT="$(
-  timeout 20s openssl s_client -connect "$REALITY_TARGET:443" -servername "$REALITY_TARGET" \
-    -tls1_3 -alpn h2 </dev/null 2>&1
-)"
-grep -q 'TLSv1.3' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET does not negotiate TLS 1.3"
-grep -q 'ALPN protocol: h2' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET does not negotiate HTTP/2"
-grep -q 'Verify return code: 0 (ok)' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET certificate validation failed"
-TARGET_HTTP="$(
-  curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "https://$REALITY_TARGET/"
-)"
-[[ "$TARGET_HTTP" == "200" ]] || die "$REALITY_TARGET returned HTTP $TARGET_HTTP instead of 200"
+if [[ "$TRANSPORT" == cdn ]]; then
+  log "Checking Cloudflare zone for $CDN_DOMAIN"
+  CLOUDFLARE_ZONE_ID="$(cf_zone_id "$CDN_DOMAIN")" || exit 1
+else
+  log "Checking REALITY target"
+  TLS_OUTPUT="$(
+    timeout 20s openssl s_client -connect "$REALITY_TARGET:443" -servername "$REALITY_TARGET" \
+      -tls1_3 -alpn h2 </dev/null 2>&1
+  )"
+  grep -q 'TLSv1.3' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET does not negotiate TLS 1.3"
+  grep -q 'ALPN protocol: h2' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET does not negotiate HTTP/2"
+  grep -q 'Verify return code: 0 (ok)' <<<"$TLS_OUTPUT" || die "$REALITY_TARGET certificate validation failed"
+  TARGET_HTTP="$(
+    curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "https://$REALITY_TARGET/"
+  )"
+  [[ "$TARGET_HTTP" == "200" ]] || die "$REALITY_TARGET returned HTTP $TARGET_HTTP instead of 200"
+fi
 
 if [[ ! -f "$SSH_KEY_PATH" ]]; then
   (( VERIFY_ONLY == 0 )) || die "Verification requires the existing SSH key: $SSH_KEY_PATH"
@@ -567,7 +717,8 @@ REMOTE
   [[ "$(ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo whoami')" == root ]] ||
     die "ops sudo verification failed; SSH policy has not been changed"
 
-  ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' <<'REMOTE'
+  ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' -- \
+    "$(nftables_config | base64 -w0)" <<'REMOTE'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -582,30 +733,8 @@ systemctl restart ssh
 
 apt-get install -y -qq nftables
 command -v ufw >/dev/null 2>&1 && ufw --force disable >/dev/null
-cat >/etc/nftables.conf <<'EOF'
-#!/usr/sbin/nft -f
-flush ruleset
-
-table inet filter {
-  chain input {
-    type filter hook input priority 0; policy drop;
-
-    ct state established,related accept
-    ct state invalid drop
-    iif lo accept
-
-    tcp dport 22 accept
-    tcp dport { 80, 443 } accept
-    udp dport 443 accept
-
-    ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
-    ip6 nexthdr icmpv6 accept
-  }
-
-  chain forward { type filter hook forward priority 0; policy drop; }
-  chain output  { type filter hook output  priority 0; policy accept; }
-}
-EOF
+base64 -d <<<"$1" >/etc/nftables.conf
+chmod 755 /etc/nftables.conf
 nft -c -f /etc/nftables.conf
 systemctl enable --now nftables >/dev/null
 nft -f /etc/nftables.conf
@@ -621,8 +750,12 @@ REMOTE
   [[ "$(ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo whoami')" == "root" ]] ||
     die "ops sudo verification failed"
 
-  log "Checking target from the server"
-  ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' -- "$REALITY_TARGET" <<'REMOTE'
+  if [[ "$TRANSPORT" == cdn ]]; then
+    log "Pointing $CDN_DOMAIN at the server through Cloudflare"
+    cf_dns_apply "$CLOUDFLARE_ZONE_ID" "$CDN_DOMAIN" "$PRIMARY_IP" >/dev/null || exit 1
+  else
+    log "Checking target from the server"
+    ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' -- "$REALITY_TARGET" <<'REMOTE'
 set -euo pipefail
 target="$1"
 output="$(timeout 20s openssl s_client -connect "$target:443" -servername "$target" -tls1_3 -alpn h2 </dev/null 2>&1)"
@@ -643,6 +776,7 @@ grep -q 'Verify return code: 0 (ok)' <<<"$output" || {
   exit 1
 }
 REMOTE
+  fi
 
   log "Installing Xray $XRAY_VERSION"
   ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' -- \
@@ -674,11 +808,26 @@ fi
 [[ "v$(xray version | awk 'NR==1{print $2}')" == "$version" ]]
 REMOTE
 
-  if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ||
-        -z "${VPN_UUID:-}" || -z "${REALITY_SHORT_ID:-}" ]]; then
-    log "Generating REALITY credentials"
-    CREDENTIALS="$(
-      ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' <<'REMOTE'
+  if (( CREDENTIAL_COUNT == 0 )); then
+    log "Generating $TRANSPORT credentials"
+    if [[ "$TRANSPORT" == cdn ]]; then
+      CREDENTIALS="$(
+        ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' <<'REMOTE'
+set -euo pipefail
+printf '%s\n/%s\n' "$(xray uuid)" "$(openssl rand -hex 16)"
+REMOTE
+      )"
+      mapfile -t VALUES <<<"$CREDENTIALS"
+      ((${#VALUES[@]} == 2)) || die "Unexpected credential output"
+      VPN_UUID="${VALUES[0]}"
+      CDN_WS_PATH="${VALUES[1]}"
+      validate_cdn_credentials
+      set_env VPN_UUID "$VPN_UUID"
+      set_env CDN_WS_PATH "$CDN_WS_PATH"
+      export VPN_UUID CDN_WS_PATH
+    else
+      CREDENTIALS="$(
+        ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' <<'REMOTE'
 set -euo pipefail
 keys="$(xray x25519)"
 private="$(awk '/^PrivateKey:/{print $2}' <<<"$keys")"
@@ -687,22 +836,57 @@ uuid="$(xray uuid)"
 short_id="$(openssl rand -hex 8)"
 printf '%s\n%s\n%s\n%s\n' "$private" "$public" "$uuid" "$short_id"
 REMOTE
-    )"
-    mapfile -t VALUES <<<"$CREDENTIALS"
-    ((${#VALUES[@]} == 4)) || die "Unexpected credential output"
-    REALITY_PRIVATE_KEY="${VALUES[0]}"
-    REALITY_PUBLIC_KEY="${VALUES[1]}"
-    VPN_UUID="${VALUES[2]}"
-    REALITY_SHORT_ID="${VALUES[3]}"
-    validate_reality_credentials
-    set_env REALITY_PRIVATE_KEY "$REALITY_PRIVATE_KEY"
-    set_env REALITY_PUBLIC_KEY "$REALITY_PUBLIC_KEY"
-    set_env VPN_UUID "$VPN_UUID"
-    set_env REALITY_SHORT_ID "$REALITY_SHORT_ID"
-    export REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY VPN_UUID REALITY_SHORT_ID
+      )"
+      mapfile -t VALUES <<<"$CREDENTIALS"
+      ((${#VALUES[@]} == 4)) || die "Unexpected credential output"
+      REALITY_PRIVATE_KEY="${VALUES[0]}"
+      REALITY_PUBLIC_KEY="${VALUES[1]}"
+      VPN_UUID="${VALUES[2]}"
+      REALITY_SHORT_ID="${VALUES[3]}"
+      validate_reality_credentials
+      set_env REALITY_PRIVATE_KEY "$REALITY_PRIVATE_KEY"
+      set_env REALITY_PUBLIC_KEY "$REALITY_PUBLIC_KEY"
+      set_env VPN_UUID "$VPN_UUID"
+      set_env REALITY_SHORT_ID "$REALITY_SHORT_ID"
+      export REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY VPN_UUID REALITY_SHORT_ID
+    fi
   fi
 
-  validate_reality_credentials
+  validate_credentials
+  if [[ "$TRANSPORT" == cdn ]]; then
+    log "Issuing a Cloudflare origin certificate"
+    CSR="$(
+      ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' -- "$CDN_DOMAIN" <<'REMOTE'
+set -euo pipefail
+host="$1"
+install -d -m 750 -o root -g root /usr/local/etc/xray/tls
+umask 077
+if [[ ! -s /usr/local/etc/xray/tls/origin.key ]]; then
+  openssl ecparam -genkey -name prime256v1 -out /usr/local/etc/xray/tls/origin.key
+fi
+openssl req -new -key /usr/local/etc/xray/tls/origin.key -subj "/CN=$host" -outform PEM
+REMOTE
+    )"
+    [[ "$CSR" == *"BEGIN CERTIFICATE REQUEST"* ]] || die "The server did not produce a valid CSR"
+    ORIGIN_CERTIFICATE_OUTPUT="$(cf_origin_certificate "$CDN_DOMAIN" "$CSR")" || exit 1
+    ORIGIN_CERTIFICATE_ID="$(sed -n '1p' <<<"$ORIGIN_CERTIFICATE_OUTPUT")"
+    sed -n '2p' <<<"$ORIGIN_CERTIFICATE_OUTPUT" |
+      python3 -c 'import json, sys; sys.stdout.write(json.loads(sys.stdin.read()))' |
+      ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" \
+        'sudo install -m 640 /dev/stdin /usr/local/etc/xray/tls/origin.crt'
+    set_env CLOUDFLARE_ZONE_ID "$CLOUDFLARE_ZONE_ID"
+    set_env CLOUDFLARE_CERTIFICATE_ID "$ORIGIN_CERTIFICATE_ID"
+    ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'sudo bash -se' <<'REMOTE'
+set -euo pipefail
+service_user="$(systemctl show xray -p User --value)"
+service_user="${service_user:-root}"
+service_group="$(systemctl show xray -p Group --value)"
+service_group="${service_group:-$(id -gn "$service_user")}"
+chown -R "root:$service_group" /usr/local/etc/xray/tls
+chmod 750 /usr/local/etc/xray/tls
+chmod 640 /usr/local/etc/xray/tls/origin.key /usr/local/etc/xray/tls/origin.crt
+REMOTE
+  fi
   log "Writing Xray configuration"
   CONFIG="$(
     python3 - <<'PY'
@@ -710,11 +894,40 @@ import json
 import os
 
 values = os.environ
-print(json.dumps({
-    "log": {"loglevel": "warning"},
-    "inbounds": [
+if values["TRANSPORT"] == "cdn":
+    # Cloudflare terminates the visitor's TLS and reconnects to this listener,
+    # so the inbound is an ordinary HTTPS origin carrying a WebSocket upgrade.
+    inbounds = [{
+        "tag": "proxy-in",
+        "listen": "0.0.0.0",
+        "port": 443,
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": values["VPN_UUID"]}],
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "tls",
+            "tlsSettings": {
+                "alpn": ["http/1.1"],
+                "certificates": [{
+                    "certificateFile": "/usr/local/etc/xray/tls/origin.crt",
+                    "keyFile": "/usr/local/etc/xray/tls/origin.key",
+                }],
+            },
+            "wsSettings": {"path": values["CDN_WS_PATH"]},
+        },
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"],
+            "routeOnly": True,
+        },
+    }]
+else:
+    inbounds = [
         {
-            "tag": "reality-in",
+            "tag": "proxy-in",
             "listen": "0.0.0.0",
             "port": 443,
             "protocol": "vless",
@@ -750,7 +963,10 @@ print(json.dumps({
                 "network": "tcp",
             },
         },
-    ],
+    ]
+print(json.dumps({
+    "log": {"loglevel": "warning"},
+    "inbounds": inbounds,
     "outbounds": [
         {"tag": "direct", "protocol": "freedom"},
         {"tag": "block", "protocol": "blackhole"},
@@ -760,7 +976,7 @@ print(json.dumps({
         "rules": [
             {
                 "outboundTag": "block",
-                "inboundTag": ["reality-in"],
+                "inboundTag": ["proxy-in"],
                 "ip": ["geoip:cn", "geoip:private"],
             },
             {"outboundTag": "block", "protocol": ["bittorrent"]},
@@ -818,12 +1034,13 @@ REMOTE
       die "Server reboot did not complete"
   fi
 else
-  validate_reality_credentials
+  validate_credentials
 fi
 
 log "Verifying server"
-ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' <<'REMOTE'
+ssh "${SSH_OPTIONS[@]}" "ops@$PRIMARY_IP" 'bash -se' -- "$TRANSPORT" <<'REMOTE'
 set -euo pipefail
+transport="$1"
 for _ in $(seq 1 30); do
   [[ "$(timedatectl show -p NTPSynchronized --value)" == "yes" ]] && break
   sleep 2
@@ -848,30 +1065,52 @@ sudo ss -tlnH 'sport = :443' | grep -q . || {
   echo "FAIL: nothing is listening on TCP 443" >&2
   exit 1
 }
-sudo ss -tlnH 'sport = :80' | grep -q . || {
-  echo "FAIL: nothing is listening on TCP 80" >&2
-  exit 1
-}
+if [[ "$transport" == cdn ]]; then
+  sudo nft list ruleset | grep -q 'cloudflare' || {
+    echo "FAIL: port 443 is not restricted to Cloudflare" >&2
+    exit 1
+  }
+else
+  sudo ss -tlnH 'sport = :80' | grep -q . || {
+    echo "FAIL: nothing is listening on TCP 80" >&2
+    exit 1
+  }
+fi
 [[ "$(timedatectl show -p NTPSynchronized --value)" == "yes" ]] || {
   echo "FAIL: clock is not synchronized" >&2
   exit 1
 }
 REMOTE
 
-HTTPS_CODE="$(
-  curl -sS --max-time 15 -o /dev/null -w '%{http_code}' \
-    "https://$REALITY_TARGET/" --resolve "$REALITY_TARGET:443:$PRIMARY_IP"
-)"
-[[ "$HTTPS_CODE" == "200" ]] || die "Camouflage HTTPS returned $HTTPS_CODE"
-CERTIFICATE_OUTPUT="$(
-  timeout 20s openssl s_client -connect "$PRIMARY_IP:443" -servername "$REALITY_TARGET" </dev/null 2>&1
-)"
-grep -q 'Verify return code: 0 (ok)' <<<"$CERTIFICATE_OUTPUT" ||
-  die "Camouflage certificate validation failed"
+if [[ "$TRANSPORT" == cdn ]]; then
+  # A wrong SSL/TLS mode or an unproxied record shows up here rather than as a
+  # silent failure on the phone later.
+  EDGE_OUTPUT="$(
+    timeout 20s openssl s_client -connect "$CDN_DOMAIN:443" -servername "$CDN_DOMAIN" </dev/null 2>&1
+  )"
+  grep -q 'Verify return code: 0 (ok)' <<<"$EDGE_OUTPUT" ||
+    die "$CDN_DOMAIN does not present a valid certificate"
+  ORIGIN_OUTPUT="$(
+    timeout 20s openssl s_client -connect "$PRIMARY_IP:443" -servername "$CDN_DOMAIN" </dev/null 2>&1
+  )"
+  grep -q 'O = CloudFlare, Inc.' <<<"$ORIGIN_OUTPUT" ||
+    die "The origin is not presenting the Cloudflare origin certificate"
+else
+  HTTPS_CODE="$(
+    curl -sS --max-time 15 -o /dev/null -w '%{http_code}' \
+      "https://$REALITY_TARGET/" --resolve "$REALITY_TARGET:443:$PRIMARY_IP"
+  )"
+  [[ "$HTTPS_CODE" == "200" ]] || die "Camouflage HTTPS returned $HTTPS_CODE"
+  CERTIFICATE_OUTPUT="$(
+    timeout 20s openssl s_client -connect "$PRIMARY_IP:443" -servername "$REALITY_TARGET" </dev/null 2>&1
+  )"
+  grep -q 'Verify return code: 0 (ok)' <<<"$CERTIFICATE_OUTPUT" ||
+    die "Camouflage certificate validation failed"
+fi
 
 if [[ "$SKIP_CLIENT_TEST" != "1" ]]; then
-  log "Testing authenticated REALITY traffic"
-  test_reality_client
+  log "Testing authenticated $TRANSPORT traffic"
+  test_tunnel_client
 fi
 
 if (( VERIFY_ONLY == 0 || EXPORT_CLIENT == 1 )); then

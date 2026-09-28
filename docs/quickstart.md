@@ -51,6 +51,17 @@ The target is a public HTTPS site used for camouflage, not a domain you own.
 Choose one that passes [the target checks](03-vless-reality.md#target).
 Enter only its hostname, without `https://` or a path.
 
+Want the Cloudflare route instead? Set the transport on this first run:
+
+```bash
+TRANSPORT=cdn ./scripts/bring-up.sh
+```
+
+It then asks for your hostname and a Cloudflare API token rather than a
+camouflage target. [CDN fronting](06-cdn-fronting.md) lists the token
+permissions and the dashboard setting it depends on. The choice is saved, so
+later runs need no variable.
+
 The default is Osaka, Ubuntu 24.04, and `vc2-1c-1gb`. The script installs Xray,
 reboots the server, and checks an authenticated connection. Wait for `READY`.
 An error can leave a billable instance behind; check Vultr before walking away.

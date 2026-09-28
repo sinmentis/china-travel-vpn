@@ -8,6 +8,7 @@ blocked network path can look much the same from a phone.
 | What you see | Start here |
 |---|---|
 | Cannot reach the machine | [Server and port checks](#server-state) |
+| Client says connected, nothing loads | [Is the address blocked?](#blocked) |
 | TLS responds, but the proxy fails | [Camouflage versus authentication](#camouflage) |
 | Connected, but some sites fail | [Routing and website checks](#websites) |
 | Connected, but slow | [Speed](#speed) |
@@ -64,6 +65,55 @@ Test-NetConnection SERVER_IP -Port 443
 If Xray is listening but the port is unreachable, inspect `sudo nft list ruleset`
 and any Vultr firewall attached to the instance. Then try a second access
 network. A failed ping alone is not evidence of a blocked IP; ICMP can be filtered.
+
+<a id="blocked"></a>
+
+## Is the address blocked?
+
+The confusing case: the app says **Connected**, but nothing loads and it never
+shows an exit IP. That usually means the tunnel was never established. Most
+clients bring up the local interface first and only find out later that the
+server is unreachable, so "Connected" is not evidence of anything.
+
+Check two things before blaming the network. Does it fail on both Wi-Fi and
+cellular? And does a page that needs no DNS also fail?
+
+```bash
+curl -sS --max-time 10 https://1.1.1.1/cdn-cgi/trace
+```
+
+If one access network works and the other does not, it is that network, not
+your server. If both fail on an address-only URL, keep going.
+
+Now settle it from the server side. The question is whether the client's
+packets arrive at all. Run this on the server, then try to connect from the
+blocked network while it is running:
+
+```bash
+sudo timeout 60s tcpdump -n -i any "tcp port 443 and tcp[tcpflags] & tcp-syn != 0"
+```
+
+Read the result like this:
+
+| What you see | What it means |
+|---|---|
+| Nothing at all from the client | The path is blocked; the address is the problem |
+| Incoming `SYN`, and a reply, nothing more | Packets arrive but the handshake dies |
+| Full handshake, then nothing | Authentication or configuration, not the network |
+
+An empty capture is the important one. If not a single packet from that
+network reaches the server while you are actively reconnecting, no
+configuration change will help. The address is being dropped in transit.
+
+Two cautions. Run the capture while the client is really retrying, or you will
+read an idle window as proof of blocking. And ignore ping: ICMP is filtered
+independently, so a failed ping proves nothing either way.
+
+A blocked address has two fixes. [Replacing the instance](#replace-server)
+gets a new address, which works until that one is blocked too. Moving to
+[CDN fronting](docs/06-cdn-fronting.md) removes the problem instead of
+rescheduling it, because there is no longer an origin address to block. The
+first is faster; the second is the one that lasts.
 
 <a id="camouflage"></a>
 
@@ -152,6 +202,12 @@ Do this when you have decided to replace it, not as the first connectivity
 test. A new IP may help with a path or reputation problem; it cannot fix every
 failure.
 
+If you are replacing the server because the old address was blocked, be honest
+about what this buys you. A fresh address from the same provider sits in the
+same pools and can be blocked the same way, sometimes quickly. It is the right
+move when you need to be online now. It is not a fix. When you are tired of
+repeating it, switch to [CDN fronting](docs/06-cdn-fronting.md).
+
 For a scripted deployment, use the original checkout and keep the old instance
 until the new one works. The two instances overlap briefly during replacement.
 
@@ -164,7 +220,7 @@ chmod 600 .env.replacement
 
 2. Edit `.env.replacement`. Change `VULTR_INSTANCE_LABEL` to an unused label
    beginning with `personal-vpn-`, for example `personal-vpn-replacement`.
-   Keep the SSH and REALITY credentials.
+   Keep the SSH and proxy credentials.
 
 3. Create the replacement:
 

@@ -70,6 +70,15 @@ class DocumentationTests(unittest.TestCase):
                 guide = (ROOT / "docs" / ("03-vless-reality" + suffix)).read_text()
                 self.assertIn(f"INSTALLER_{name}={pin}", guide)
 
+    def test_every_transport_is_documented(self):
+        script = (ROOT / "scripts" / "bring-up.sh").read_text()
+        accepted = set(re.findall(r'"\$TRANSPORT" == ([a-z]+)', script))
+        self.assertEqual(accepted, {"reality", "cdn"})
+        for suffix in (".md", ".zh-CN.md"):
+            readme = (ROOT / ("README" + suffix.replace(".md", "") + ".md")).read_text()
+            self.assertIn("TRANSPORT=cdn", readme)
+            self.assertTrue((ROOT / "docs" / ("06-cdn-fronting" + suffix)).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

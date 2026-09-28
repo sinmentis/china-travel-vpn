@@ -47,6 +47,36 @@ The [upstream REALITY documentation](https://github.com/XTLS/REALITY) describes
 the design. The [manual configuration](docs/03-vless-reality.md) is the concrete
 version used here.
 
+<a id="address"></a>
+
+## The protocol was never the weak part
+
+The failure that ends this kind of setup is not a broken handshake. It is an
+address that stops receiving packets.
+
+Censorship does not have to inspect anything to be effective. Dropping traffic
+to one IP is cheaper than analysing it, and it works no matter how convincing
+the protocol is. Cloud provider ranges are heavily used for circumvention and
+are treated accordingly; an address can also arrive already burned by whoever
+held it before you.
+
+This is worth stating plainly because it inverts the intuition the protocol
+encourages. REALITY is good at what it does, and none of it applies once the
+packets are dropped in transit. A capture on the server settles it in a minute:
+[if no SYN arrives](TROUBLESHOOTING.md#blocked) while a client is actively
+retrying, nothing in the configuration is responsible.
+
+Rotating to a new address works and keeps working for a while, which is what
+makes it a trap. Each rotation costs a deploy and buys an unknown amount of
+time. [CDN fronting](docs/06-cdn-fronting.md) changes the shape of the problem:
+clients connect to Cloudflare's addresses, and blocking those means blocking
+a large amount of unrelated traffic. The origin address is never published, so
+there is nothing to discover and nothing to block.
+
+The cost is real and worth weighing. An extra hop and a second TLS termination
+make it slower, and it needs a domain. The honest summary is that REALITY is
+the better route right up until the moment it is not.
+
 <a id="service-user"></a>
 
 ## `root` can read it. Xray might not.

@@ -29,6 +29,11 @@
 SNI 是 TLS 握手里发送的域名。这里填伪装目标域名，不是服务器 IP。
 公钥用 Xray 输出里标成 `Password (PublicKey)` 的那项，不是 `Hash32`。
 
+走 [CDN 线路](06-cdn-fronting.zh-CN.md)时这些字段不一样：
+地址是你自己的主机名，传输方式是 WebSocket 加那个密钥路径，
+TLS 安全类型是普通的 `tls`，而且**没有** flow 这一项。
+这一步之后的内容两条线路完全相同。
+
 ## 21. Windows
 
 安装 [v2rayN](https://github.com/2dust/v2rayN)。从剪贴板导入 VLESS 链接，

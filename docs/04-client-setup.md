@@ -31,6 +31,11 @@ SNI is the hostname sent during the TLS handshake. Use the target hostname,
 not the server IP. The public key is the value Xray labels
 `Password (PublicKey)`, not `Hash32`.
 
+On the [CDN route](06-cdn-fronting.md) the fields are different: the address is
+your own hostname, the transport is WebSocket with its secret path, TLS
+security is plain `tls`, and there is **no** flow value. Everything after this
+step works the same either way.
+
 ## 21. Windows
 
 Install [v2rayN](https://github.com/2dust/v2rayN). Import the VLESS link from

@@ -50,8 +50,10 @@ Confirm the instance is gone and check the billing page for other resources.
 Deletion ends that instance's future charges; it does not erase charges already
 incurred or delete separately billed storage and snapshots.
 
-The teardown script keeps reusable SSH and REALITY credentials. Revoke the API
-key when you no longer need automation.
+The teardown script keeps reusable SSH and proxy credentials. On the CDN route
+it also removes the Cloudflare DNS record and revokes the origin certificate,
+so nothing is left pointing at an address that will be reissued to somebody
+else. Revoke the API keys when you no longer need automation.
 Its dry run leaves local files untouched, including when no instance is found.
 Local instance records are removed only after a confirmed deletion or explicit
 `--yes` cleanup of an already absent instance.

@@ -2,10 +2,28 @@
 
 **English** · [中文](README.zh-CN.md)
 
-One small Vultr server in Osaka, 1 GB of memory, and Xray running VLESS +
-Vision + REALITY on TCP `443`. This repository contains the setup, client
-configuration, and teardown instructions. There is no management panel and
-no domain to buy.
+One small Vultr server in Osaka, 1 GB of memory, and Xray. This repository
+contains the setup, client configuration, and teardown instructions. There is
+no management panel.
+
+It ships two ways of carrying the traffic, and you pick one when you deploy.
+
+| | REALITY (default) | [CDN fronting](docs/06-cdn-fronting.md) |
+|---|---|---|
+| Speed | Fast, one hop | Slower, extra hop |
+| Survives an IP block | No | Yes |
+| Needs a domain | No | Yes |
+
+The default is VLESS + Vision + REALITY on TCP `443`, straight to the server.
+It is the faster of the two and needs nothing but the server itself. Its
+weakness is that everything depends on one address staying reachable. When
+that address gets blocked, the protocol cannot save it — the packets simply
+stop arriving.
+
+The other route puts Cloudflare in front and speaks VLESS over WebSocket. You
+hand out a hostname instead of an address, so there is no origin IP to block.
+It costs latency and a domain. Use REALITY while it works and switch when it
+does not.
 
 One server also means one point of failure. If it stops working, there is no
 second endpoint waiting to take over. That is the trade-off here: fewer things
@@ -14,10 +32,11 @@ to maintain, in exchange for accepting downtime while fixing the connection.
 ## What has actually worked
 
 The documented checks cover deployment, reboot recovery, and authenticated
-connections with sing-box and Streisand. They do not establish performance on
-mainland Chinese access networks, at peak hours, or over extended use.
-REALITY reduces some differences between the tunnel and ordinary TLS traffic;
-it does not make the server unblockable.
+connections with sing-box and Streisand, on both routes. They do not establish
+performance on mainland Chinese access networks, at peak hours, or over
+extended use. REALITY reduces some differences between the tunnel and ordinary
+TLS traffic; it does not make the server unblockable. That is exactly why the
+CDN route exists.
 
 One useful detail from the setup: checking the configuration as `root` would
 have missed a permissions problem. The installer runs Xray as `nobody`, which
@@ -42,8 +61,18 @@ real connection through it, and writes a client import link. Running it again
 does **not** rotate the IP. Replacing a server is a
 [separate procedure](TROUBLESHOOTING.md#replace-server).
 
-Prefer to run the commands yourself? The [manual setup](SETUP.md) has five
-short pages. If the server is already running, go straight to
+To put Cloudflare in front instead, set the transport once:
+
+```bash
+TRANSPORT=cdn ./scripts/bring-up.sh
+```
+
+That route needs a domain on Cloudflare and an API token. The
+[CDN page](docs/06-cdn-fronting.md) covers both, plus the one dashboard
+setting that silently breaks everything if it is wrong.
+
+Prefer to run the commands yourself? The [manual setup](SETUP.md) has the same
+steps as short pages. If the server is already running, go straight to
 [client setup](docs/04-client-setup.md). For a broken connection, use the
 [troubleshooting notes](TROUBLESHOOTING.md).
 

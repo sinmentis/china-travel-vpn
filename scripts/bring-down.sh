@@ -6,6 +6,8 @@ ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env.vultr}"
 API="${VULTR_API:-https://api.vultr.com/v2}"
 # shellcheck source=scripts/lib/vultr.sh
 source "$ROOT_DIR/scripts/lib/vultr.sh"
+# shellcheck source=scripts/lib/cloudflare.sh
+source "$ROOT_DIR/scripts/lib/cloudflare.sh"
 CONFIRMED=0
 DRY_RUN=0
 FORCE=0
@@ -37,10 +39,33 @@ remove_runtime_values() {
   temporary="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
   awk '
     index($0, "VULTR_INSTANCE_ID=") != 1 &&
-    index($0, "PRIMARY_IP=") != 1
+    index($0, "PRIMARY_IP=") != 1 &&
+    index($0, "CLOUDFLARE_CERTIFICATE_ID=") != 1
   ' "$ENV_FILE" >"$temporary"
   chmod 600 "$temporary"
   mv "$temporary" "$ENV_FILE"
+}
+
+# The DNS record and origin certificate outlive the server, and the address can
+# be reissued to someone else. Release them with the instance.
+release_cloudflare_resources() {
+  [[ "${TRANSPORT:-reality}" == cdn ]] || return 0
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" && -n "${CDN_DOMAIN:-}" ]] || {
+    printf 'WARNING: No Cloudflare credentials saved; remove the DNS record by hand.\n' >&2
+    return 0
+  }
+  validate_cloudflare_token || return 0
+  local zone
+  if zone="$(cf_zone_id "$CDN_DOMAIN")" && [[ -n "$zone" ]]; then
+    if ! cf_dns_remove "$zone" "$CDN_DOMAIN" >/dev/null; then
+      printf 'WARNING: Could not remove the %s DNS record.\n' "$CDN_DOMAIN" >&2
+    fi
+  else
+    printf 'WARNING: Could not find the Cloudflare zone for %s.\n' "$CDN_DOMAIN" >&2
+  fi
+  if [[ -n "${CLOUDFLARE_CERTIFICATE_ID:-}" ]]; then
+    cf_certificate_revoke "$CLOUDFLARE_CERTIFICATE_ID"
+  fi
 }
 
 [[ -f "$ENV_FILE" ]] || die "Missing $ENV_FILE"
@@ -53,9 +78,11 @@ if (( DRY_RUN == 0 )); then
   flock -n "$ENV_LOCK_FD" || die "Another lifecycle operation is using $ENV_FILE"
 fi
 unset VULTR_API_KEY VULTR_INSTANCE_LABEL VULTR_INSTANCE_ID PRIMARY_IP
+unset TRANSPORT CDN_DOMAIN CLOUDFLARE_API_TOKEN CLOUDFLARE_CERTIFICATE_ID
 # shellcheck source=/dev/null
 source "$ENV_FILE"
 export -n VULTR_API_KEY
+export -n CLOUDFLARE_API_TOKEN
 validate_api_key
 
 LABEL="${VULTR_INSTANCE_LABEL:-personal-vpn-primary}"
@@ -112,6 +139,7 @@ if (( CONFIRMED == 0 )); then
 fi
 
 delete_instance "$INSTANCE_ID"
+release_cloudflare_resources
 
 if [[ -n "$INSTANCE_IP" ]] && command -v ssh-keygen >/dev/null 2>&1; then
   if ! ssh-keygen -R "$INSTANCE_IP" >/dev/null 2>&1; then
@@ -120,4 +148,4 @@ if [[ -n "$INSTANCE_IP" ]] && command -v ssh-keygen >/dev/null 2>&1; then
 fi
 remove_runtime_values
 rm -f "$ROOT_DIR/primary-ios.local.txt" "$ROOT_DIR/primary-ios.local.png"
-printf 'Destroyed %s. Reusable SSH and REALITY credentials were kept.\n' "$LABEL"
+printf 'Destroyed %s. Reusable SSH and proxy credentials were kept.\n' "$LABEL"

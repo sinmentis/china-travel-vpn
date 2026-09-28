@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 from pathlib import Path
@@ -36,7 +37,12 @@ from urllib.parse import parse_qs, urlsplit
 
 arguments = sys.argv[1:]
 url = next(argument for argument in arguments if argument.startswith(("http://", "https://")))
-if not url.startswith(("http://release-check.invalid/v2/", "https://target.example/")):
+if not url.startswith((
+    "http://release-check.invalid/v2/",
+    "http://release-check.invalid/client/v4/",
+    "https://www.cloudflare.com/ips-v4",
+    "https://target.example/",
+)):
     raise SystemExit("Unexpected endpoint in isolated test")
 method = arguments[arguments.index("-X") + 1] if "-X" in arguments else "GET"
 with Path(os.environ["TEST_REQUESTS"]).open("a") as output:
@@ -51,6 +57,44 @@ status = int(os.environ.get("TEST_HTTP_STATUS", "200"))
 body = ""
 if url.startswith("https://target.example/"):
     status = 200
+elif url == "https://www.cloudflare.com/ips-v4":
+    body = "173.245.48.0/20\n103.21.244.0/22\n103.22.200.0/22\n141.101.64.0/18\n108.162.192.0/18\n190.93.240.0/20\n"
+elif path.startswith("/client/v4/"):
+    import base64 as _base64
+    request = sys.stdin.read() if method in ("POST", "PUT") else ""
+    zone_name = os.environ.get("TEST_CLOUDFLARE_ZONE", "example.test")
+    zone_id = "1" * 32
+    record_id = "2" * 32
+    certificate_id = "3" * 32
+    if os.environ.get("TEST_CLOUDFLARE_FAILURE") == "1":
+        body = json.dumps({"success": False, "errors": [{"code": 10000, "message": "Authentication error"}]})
+    elif path == "/client/v4/zones":
+        requested = parse_qs(urlsplit(url).query).get("name", [""])[0]
+        zones = [{"id": zone_id, "name": zone_name}] if requested == zone_name else []
+        body = json.dumps({"success": True, "errors": [], "result": zones})
+    elif path.endswith("/dns_records") and method == "GET":
+        existing = []
+        if os.environ.get("TEST_CLOUDFLARE_RECORD_EXISTS") == "1":
+            existing = [{"id": record_id, "type": "A",
+                         "name": parse_qs(urlsplit(url).query).get("name", [""])[0]}]
+        body = json.dumps({"success": True, "errors": [], "result": existing})
+    elif path.endswith("/dns_records") or "/dns_records/" in path:
+        if method == "DELETE":
+            body = json.dumps({"success": True, "errors": [], "result": {"id": record_id}})
+        else:
+            sent = json.loads(request)
+            Path(os.environ["TEST_CLOUDFLARE_RECORD"]).write_text(request)
+            if os.environ.get("TEST_CLOUDFLARE_UNPROXIED") == "1":
+                sent["proxied"] = False
+            body = json.dumps({"success": True, "errors": [], "result": dict(sent, id=record_id)})
+    elif path == "/client/v4/certificates" and method == "POST":
+        Path(os.environ["TEST_CLOUDFLARE_CSR"]).write_text(json.loads(request)["csr"])
+        der = _base64.b64encode(bytes([0x30]) + b"fixture-origin-certificate" * 4).decode()
+        pem = "-----BEGIN CERTIFICATE-----\n" + der + "\n-----END CERTIFICATE-----\n"
+        body = json.dumps({"success": True, "errors": [],
+                           "result": {"id": certificate_id, "certificate": pem}})
+    else:
+        body = json.dumps({"success": True, "errors": [], "result": {"id": certificate_id}})
 elif path == "/v2/account":
     body = Path(os.environ["TEST_ACCOUNT"]).read_text()
 elif path == "/v2/ssh-keys":
@@ -140,6 +184,13 @@ elif 'keys="$(xray x25519)"' in payload:
     print("B" * 43)
     print("11111111-2222-4333-8444-555555555555")
     print("0123456789abcdef")
+elif "openssl rand -hex 16" in payload:
+    print("11111111-2222-4333-8444-555555555555")
+    print("/" + "a" * 32)
+elif "openssl req -new -key" in payload:
+    print("-----BEGIN CERTIFICATE REQUEST-----")
+    print("Zml4dHVyZS1jZXJ0aWZpY2F0ZS1zaWduaW5nLXJlcXVlc3Q=")
+    print("-----END CERTIFICATE REQUEST-----")
 elif "install -m 600 /dev/stdin" in command and payload.startswith("{"):
     json.loads(payload)
 """
@@ -454,7 +505,9 @@ class LifecycleTests(ScriptSandbox):
         self.assert_no_deletes()
 
 
-class BringUpTests(ScriptSandbox):
+class ServerSandbox(ScriptSandbox):
+    """Shared fixture for tests that drive a full deployment."""
+
     def setUp(self):
         super().setUp()
         self.key = self.root / "home" / "travel_ed25519"
@@ -462,6 +515,27 @@ class BringUpTests(ScriptSandbox):
         self.key.write_text("fixture private key")
         self.key.chmod(0o600)
         self.key.with_suffix(".pub").write_text(self.public_key)
+        self.environment.update({
+            "TEST_PUBLIC_KEY": self.public_key,
+            "TEST_SSH_REQUESTS": str(self.root / "ssh.jsonl"),
+            "BRING_UP_SKIP_CLIENT_TEST": "1",
+            "BRING_UP_SKIP_REBOOT": "1",
+        })
+        for name, contents in {
+            "openssl": "#!/bin/sh\nif [ \"$1\" = rand ]; then printf 'fixture-passphrase\\n'; else printf 'TLSv1.3\\nALPN protocol: h2\\nVerify return code: 0 (ok)\\nO = CloudFlare, Inc.\\n'; fi\n",
+            "ssh-agent": "#!/bin/sh\nprintf 'SSH_AGENT_PID=424242; export SSH_AGENT_PID;\\n'\n",
+            "ssh-add": "#!/bin/sh\nexit 0\n",
+            "ssh": SSH_STUB,
+            "sleep": "#!/bin/sh\nexit 0\n",
+        }.items():
+            path = self.root / "bin" / name
+            path.write_text(contents)
+            path.chmod(0o700)
+
+
+class BringUpTests(ServerSandbox):
+    def setUp(self):
+        super().setUp()
         self.original_env += (
             f"SSH_KEY_PATH={self.key}\n"
             "SSH_KEY_PASSPHRASE=fixture\n"
@@ -471,22 +545,6 @@ class BringUpTests(ScriptSandbox):
             "REALITY_SHORT_ID=0123456789abcdef\n"
         )
         self.env_file.write_text(self.original_env)
-        self.environment.update({
-            "TEST_PUBLIC_KEY": self.public_key,
-            "TEST_SSH_REQUESTS": str(self.root / "ssh.jsonl"),
-            "BRING_UP_SKIP_CLIENT_TEST": "1",
-            "BRING_UP_SKIP_REBOOT": "1",
-        })
-        for name, contents in {
-            "openssl": "#!/bin/sh\nif [ \"$1\" = rand ]; then printf 'fixture-passphrase\\n'; else printf 'TLSv1.3\\nALPN protocol: h2\\nVerify return code: 0 (ok)\\n'; fi\n",
-            "ssh-agent": "#!/bin/sh\nprintf 'SSH_AGENT_PID=424242; export SSH_AGENT_PID;\\n'\n",
-            "ssh-add": "#!/bin/sh\nexit 0\n",
-            "ssh": SSH_STUB,
-            "sleep": "#!/bin/sh\nexit 0\n",
-        }.items():
-            path = self.root / "bin" / name
-            path.write_text(contents)
-            path.chmod(0o700)
 
     def test_verify_only_preserves_state_and_imports(self):
         result = self.run_script("bring-up.sh", "--verify-only")
@@ -620,6 +678,148 @@ class BringUpTests(ScriptSandbox):
         result = self.run_script("bring-up.sh")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls(), [])
+
+
+class CdnTransportTests(ServerSandbox):
+    """Covers the Cloudflare-fronted WebSocket transport end to end."""
+
+    def setUp(self):
+        super().setUp()
+        self.record = self.root / "dns-record.json"
+        self.csr = self.root / "origin.csr"
+        self.original_env = (
+            "VULTR_API_KEY=fixture\n"
+            "VULTR_INSTANCE_LABEL=personal-vpn-primary\n"
+            f"VULTR_INSTANCE_ID={INSTANCE_ID}\n"
+            "PRIMARY_IP=192.0.2.1\n"
+            "TRANSPORT=cdn\n"
+            "CDN_DOMAIN=edge.example.test\n"
+            "CLOUDFLARE_API_TOKEN=cloudflare-fixture-token-0123456789\n"
+            f"SSH_KEY_PATH={self.key}\n"
+            "SSH_KEY_PASSPHRASE=fixture\n"
+        )
+        self.env_file.write_text(self.original_env)
+        self.environment.update({
+            "CLOUDFLARE_API": "http://release-check.invalid/client/v4",
+            "TEST_CLOUDFLARE_ZONE": "example.test",
+            "TEST_CLOUDFLARE_RECORD": str(self.record),
+            "TEST_CLOUDFLARE_CSR": str(self.csr),
+            "TEST_EXISTING_CONFIG": "no",
+        })
+
+    def ssh_payloads(self):
+        path = Path(self.environment["TEST_SSH_REQUESTS"])
+        if not path.exists():
+            return []
+        return [json.loads(line)["payload"] for line in path.read_text().splitlines()]
+
+    def server_config(self):
+        for payload in self.ssh_payloads():
+            if payload.startswith("{") and '"inbounds"' in payload:
+                return json.loads(payload)
+        self.fail("the server configuration was never written")
+
+    def deploy(self):
+        result = self.run_script("bring-up.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_deployment_serves_vless_over_websocket_tls(self):
+        self.deploy()
+        inbounds = self.server_config()["inbounds"]
+        self.assertEqual(len(inbounds), 1)
+        stream = inbounds[0]["streamSettings"]
+        self.assertEqual(stream["network"], "ws")
+        self.assertEqual(stream["security"], "tls")
+        self.assertEqual(stream["wsSettings"]["path"], "/" + "a" * 32)
+        # Vision cannot ride a WebSocket; the CDN already terminated the TLS.
+        self.assertNotIn("flow", inbounds[0]["settings"]["clients"][0])
+
+    def test_deployment_points_a_proxied_record_at_the_server(self):
+        self.deploy()
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["type"], "A")
+        self.assertEqual(record["name"], "edge.example.test")
+        self.assertEqual(record["content"], "192.0.2.1")
+        self.assertIs(record["proxied"], True)
+
+    def test_deployment_requests_a_certificate_for_the_domain(self):
+        self.deploy()
+        self.assertIn("BEGIN CERTIFICATE REQUEST", self.csr.read_text())
+        saved = self.env_file.read_text()
+        self.assertIn("CLOUDFLARE_CERTIFICATE_ID=", saved)
+        self.assertIn("CDN_WS_PATH=", saved)
+
+    def test_origin_port_443_only_accepts_cloudflare(self):
+        self.deploy()
+        rules = ""
+        for entry in Path(self.environment["TEST_SSH_REQUESTS"]).read_text().splitlines():
+            for argument in json.loads(entry)["arguments"]:
+                if len(argument) > 100 and "=" not in argument[:4]:
+                    try:
+                        decoded = base64.b64decode(argument, validate=True).decode()
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if "nft" in decoded or "table inet filter" in decoded:
+                        rules = decoded
+        self.assertIn("set cloudflare", rules)
+        self.assertIn("tcp dport 443 ip saddr @cloudflare accept", rules)
+        self.assertNotIn("tcp dport { 80, 443 } accept", rules)
+
+    def test_client_link_targets_the_domain_over_websocket(self):
+        self.deploy()
+        link = self.imports[0].read_text().strip()
+        self.assertTrue(link.startswith("vless://"))
+        self.assertIn("@edge.example.test:443", link)
+        self.assertIn("type=ws", link)
+        self.assertIn("security=tls", link)
+        self.assertNotIn("flow=", link)
+        self.assertNotIn("192.0.2.1", link)
+
+    def test_incomplete_credentials_are_rejected(self):
+        self.env_file.write_text(
+            self.original_env + "VPN_UUID=11111111-2222-4333-8444-555555555555\n"
+        )
+        result = self.run_script("bring-up.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Incomplete cdn credentials", result.stderr)
+
+    def test_domain_outside_cloudflare_stops_before_the_server(self):
+        self.env_file.write_text(
+            self.original_env.replace("edge.example.test", "edge.elsewhere.test")
+        )
+        result = self.run_script("bring-up.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No active Cloudflare zone", result.stderr)
+        self.assertFalse(any(call["method"] == "POST" for call in self.calls()))
+
+    def test_teardown_releases_the_dns_record(self):
+        self.environment["TEST_CLOUDFLARE_RECORD_EXISTS"] = "1"
+        result = self.run_script("bring-down.sh", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deletes = [call["url"] for call in self.calls() if call["method"] == "DELETE"]
+        self.assertTrue(any("/dns_records/" in url for url in deletes), deletes)
+
+    def test_unknown_transport_is_rejected(self):
+        self.env_file.write_text(self.original_env.replace("TRANSPORT=cdn", "TRANSPORT=magic"))
+        result = self.run_script("bring-up.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TRANSPORT must be reality or cdn", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_cloudflare_error_is_reported_and_stops_setup(self):
+        self.environment["TEST_CLOUDFLARE_FAILURE"] = "1"
+        result = self.run_script("bring-up.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Authentication error", result.stderr)
+        self.assertFalse(any(call["method"] == "POST" for call in self.calls()))
+
+    def test_unproxied_record_is_refused(self):
+        self.environment["TEST_CLOUDFLARE_UNPROXIED"] = "1"
+        result = self.run_script("bring-up.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not proxied", result.stderr)
+        self.assertNotIn("READY", result.stdout)
 
 
 class RemoteScriptTests(unittest.TestCase):

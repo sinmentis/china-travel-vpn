@@ -49,6 +49,16 @@ printf '\n'
 先找一个通过[目标检查](03-vless-reality.zh-CN.md#target)的网站，
 只填域名，不带 `https://` 和路径。
 
+想走 Cloudflare 那条路，第一次运行时指定传输方式：
+
+```bash
+TRANSPORT=cdn ./scripts/bring-up.sh
+```
+
+这时它问的不是伪装目标，而是你的主机名和 Cloudflare API 令牌。
+[CDN 套壳](06-cdn-fronting.zh-CN.md)里列了令牌需要的权限，
+以及它依赖的那个控制台设置。选择会被保存，之后再跑不用带变量。
+
 默认开大阪、Ubuntu 24.04、`vc2-1c-1gb`。脚本会安装 Xray、重启服务器，再实际连一次隧道。
 等它输出 `READY`。中途报错可能仍留下计费中的实例，离开前去控制台看一眼。
 

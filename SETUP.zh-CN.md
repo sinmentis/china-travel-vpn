@@ -18,6 +18,9 @@
 | 20–25 | [客户端](docs/04-client-setup.zh-CN.md) | 手机或电脑的出口 IP 变成服务器 IP |
 | 26–28 | [出发前与用完后](docs/05-testing-and-teardown.zh-CN.md) | 知道怎么检查、替换和销毁 |
 
+上面这些页面搭的是 REALITY 线路。想让服务器躲到 Cloudflare 后面，
+把第 14–19 步换成 [CDN 套壳](docs/06-cdn-fronting.zh-CN.md)，其余步骤不变。
+
 `[LOCAL]` 是你操作时用的电脑。Bash 命令需要 Linux 环境；
 Windows 可以用 [WSL](https://learn.microsoft.com/windows/wsl/install)
 里的 Ubuntu，WSL 就是在 Windows 上运行 Linux 的环境。原生 PowerShell 命令会单独标出。
